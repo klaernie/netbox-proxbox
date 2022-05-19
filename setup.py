@@ -42,8 +42,8 @@ setup(
     author_email="emerson.felipe@nmultifibra.com.br",
     description="Integration between Proxmox and Netbox",
     url='https://github.com/N-Multifibra/netbox-proxbox',
-    long_description_content_type="text/markdown",
     long_description=long_description,
+    long_description_content_type="text/markdown",
     classifiers=[
         "Programming Language :: Python :: 3",
         "Framework :: Django",
