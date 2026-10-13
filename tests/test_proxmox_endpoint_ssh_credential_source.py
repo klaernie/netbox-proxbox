@@ -38,6 +38,7 @@ except Exception as exc:  # pragma: no cover - depends on external test services
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
+from netbox_proxbox.choices import ProxmoxAccessMethodChoices
 from netbox_proxbox.forms.proxmox import ProxmoxEndpointForm
 from netbox_proxbox.models import ProxmoxEndpoint
 from netbox_proxbox.models.ssh_credential import (
@@ -62,6 +63,9 @@ def _form_data(**overrides: str) -> dict[str, str]:
         "verify_ssl": "",
         "enabled": "on",
         "allow_writes": "",
+        # SSH settings are only validated for API + SSH endpoints.
+        "access_methods": ProxmoxAccessMethodChoices.API_SSH,
+        "service_monitoring_interval_minutes": "5",
         "environment": "",
         "ssh_credential_source": SSH_CRED_SOURCE_DEDICATED,
         "ssh_username": "",
@@ -117,6 +121,7 @@ class ProxmoxEndpointSSHCredentialSourceTest(TestCase):
             password="",
             token_name="root@pam!token",
             token_value="token-secret",
+            access_methods=ProxmoxAccessMethodChoices.API_SSH,
             ssh_credential_source=SSH_CRED_SOURCE_REUSE,
         )
 

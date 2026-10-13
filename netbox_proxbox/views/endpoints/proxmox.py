@@ -429,6 +429,7 @@ class ProxmoxEndpointEditView(generic.ObjectEditView):
 
     queryset = ProxmoxEndpoint.objects.all()
     form = ProxmoxEndpointForm
+    template_name = "netbox_proxbox/proxmoxendpoint_edit.html"
 
     def get_form_kwargs(self) -> dict[str, object]:
         kwargs = super().get_form_kwargs()

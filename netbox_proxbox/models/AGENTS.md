@@ -185,6 +185,10 @@ that opaque reference unchanged.
 ## Notes
 
 - `CommonProperties` and `EndpointBase` centralize endpoint URL semantics.
+- `ProxmoxEndpoint.clean()` validates SSH completeness only when
+  `ssh_access_enabled` (`access_methods == api_ssh`). An API-only endpoint may
+  hold partial or stale SSH fields without blocking a save; every SSH consumer
+  must keep gating on `ssh_access_enabled`.
 - `EndpointBase.enabled` is operational: `False` means inventory-only. Service, startup, OpenAPI, and sync code must return before any backend or remote-service connection attempt for disabled endpoint-like rows. The one signal exception is a normal disabled `ProxmoxEndpoint.save()`: after commit it may authenticate to proxbox-api solely to revoke `enabled` and `allow_packer_template_builds` on an already existing backend row; it must not contact Proxmox, create a backend row, or send endpoint credentials. `ProxmoxEndpoint.packer_template_builds_backend_authorized` records the last successfully confirmed effective narrow grant. Deletion and local-only bulk toggles stay blocked while either it or the desired narrow flag is true. Bulk enable/disable uses `queryset.update()` and remains local-only.
 - `FastAPIEndpoint.websocket_url` is distinct from the backend HTTP URL and is used by `websocket_client.py`.
 - `FastAPIEndpoint.save()` is the backend-key persistence boundary. New enabled

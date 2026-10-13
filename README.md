@@ -244,6 +244,14 @@ other tenants.
   for troubleshooting. See
   [Recovering / Regenerating Proxbox Data](docs/operations/recovering-proxbox-data.md).
 
+## What's New in v0.0.29.post4
+
+This maintenance release stops requiring SSH credentials for API-only Proxmox
+endpoints and makes the endpoint form show write-enabled and SSH settings only
+when they apply. It adds no migration.
+See [Release Notes - v0.0.29.post4](docs/release-notes/version-0.0.29.post4.md)
+for upgrade guidance.
+
 ## What's New in v0.0.29.post3
 
 This maintenance release admits every NetBox 4.7 patch release (the plugin
@@ -255,7 +263,7 @@ See [Release Notes - v0.0.29.post3](docs/release-notes/version-0.0.29.post3.md),
 
 ## What's New in v0.0.29
 
-Current backend-runtime pairing: netbox-proxbox 0.0.29.post3 <-> proxbox-api 0.0.23.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
+Current backend-runtime pairing: netbox-proxbox 0.0.29.post4 <-> proxbox-api 0.0.23.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
 
 Version 0.0.29 is the preceding security-hardening release:
 
@@ -474,7 +482,7 @@ Full notes: [Release Notes — v0.0.18](https://emersonfelipesp.github.io/netbox
 
 | NetBox | netbox-proxbox | proxbox-api | proxbox-api internal netbox-sdk (REST only) | proxmox-sdk |
 |--------|----------------|-------------|------------|-------------|
-| 4.5.8-4.7.0 GA | v0.0.29.post3 | v0.0.23.post3 | v0.0.13 | v0.0.15 |
+| 4.5.8-4.7.0 GA | v0.0.29.post4 | v0.0.23.post3 | v0.0.13 | v0.0.15 |
 | 4.5.8-4.7.0 GA | v0.0.29 | v0.0.23.post3 | v0.0.13 | v0.0.15 |
 | 4.5.8-4.7.0 GA | v0.0.27 | v0.0.23.post2 | v0.0.13 | v0.0.15 |
 | 4.5.8-4.7.0 GA | v0.0.27rc18 | v0.0.23.post2 | v0.0.13 | v0.0.15 |

@@ -88,9 +88,9 @@ topology.
 
 ### Version
 
-- Plugin version: `0.0.29.post3`
+- Plugin version: `0.0.29.post4`
 - NetBox compatibility: `4.5.8` through `4.7.99`
-- Current source pairing: `netbox-proxbox 0.0.29.post3`, `proxbox-api 0.0.23.post3`,
+- Current source pairing: `netbox-proxbox 0.0.29.post4`, `proxbox-api 0.0.23.post3`,
   `proxmox-sdk 0.0.15`, and `netbox-sdk 0.0.13`
 - Last documented released runtime pairing: `netbox-proxbox 0.0.27rc4`,
   `proxbox-api 0.0.22.post1`, `proxmox-sdk 0.0.13`, and `netbox-sdk 0.0.13`
@@ -809,6 +809,8 @@ def run_sync_stream(
 | `proxmox_endpoint_ids` | Comma-separated ProxmoxEndpoint IDs |
 | `netbox_endpoint_ids` | Comma-separated NetBoxEndpoint IDs |
 | `delete_nonexistent_backup` | Delete backup records not found in Proxmox |
+
+The Proxmox endpoint form shows read-only API settings first and reveals write-only and SSH settings only when they apply; API-only endpoints ignore SSH input entirely, see [Proxmox endpoint form](./docs/configuration/proxmox-endpoint-form.md).
 
 For estates with many Proxmox clusters, see [Large multi-cluster deployments](./docs/configuration/large-multi-cluster-deployments.md): most sync stages call proxbox-api one endpoint at a time while backup-routine, replication, firewall, and datacenter operations can fan out across every endpoint in scope, raise `PROXBOX_RATE_LIMIT` on proxbox-api for large estates, keep a single active FastAPI backend API key, and treat `custom_fields_request_delay` as compatibility-only (no runtime effect).
 

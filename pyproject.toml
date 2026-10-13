@@ -1,6 +1,6 @@
 [project]
 name = "netbox-proxbox"
-version = "0.0.29.post3"
+version = "0.0.29.post4"
 description = "Netbox Plugin - Integrate Proxmox and Netbox"
 readme = "README.md"
 authors = [
@@ -166,6 +166,7 @@ ignore = ["F403", "F401", "E501", "W293"]
 # symbols — E402 (module-level import not at top of file) is unavoidable.
 "tests/test_operational_verbs_gate.py" = ["E402"]
 "tests/test_proxmox_endpoint_ssh_credential_source.py" = ["E402"]
+"tests/test_proxmox_endpoint_api_only_ssh_optional.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"

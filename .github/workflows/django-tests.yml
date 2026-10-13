@@ -462,6 +462,7 @@ jobs:
             tests/test_sync_state_models.py
             tests/test_sync_state_contracts.py
             tests/test_proxmox_endpoint_allowed_tenants.py
+            tests/test_proxmox_endpoint_api_only_ssh_optional.py
             tests/test_proxmox_export_view.py
             tests/test_changelog_secret_redaction_django.py
             tests/test_connection_authority_django.py

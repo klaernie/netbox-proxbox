@@ -60,6 +60,8 @@ class ProxmoxEndpointSSHCredentialFormMixin(forms.Form):
         "clear_ssh_private_key",
     )
 
+    ssh_clear_field_names = ("clear_ssh_password", "clear_ssh_private_key")
+
     ssh_credential_source = forms.ChoiceField(
         choices=SSH_CRED_SOURCE_CHOICES,
         required=True,
@@ -442,23 +444,26 @@ class ProxmoxEndpointForm(ProxmoxEndpointSSHCredentialFormMixin, NetBoxModelForm
             "tenant",
             "allowed_tenants",
             "tags",
-            name="Identity and credentials",
+            name="Connection and credentials (read-only API access)",
         ),
         FieldSet(
             "allow_writes",
             "allow_packer_template_builds",
+            name="Write access (opt-in)",
+        ),
+        FieldSet(
             "access_methods",
-            name="Access control",
+            name="Access methods",
         ),
         FieldSet(
             *ProxmoxEndpointSSHCredentialFormMixin.ssh_credential_field_names,
-            name="SSH credential access",
+            name="SSH credential access (API + SSH only)",
         ),
         FieldSet(
             "service_monitoring_enabled",
             "service_monitoring_interval_minutes",
             "service_monitoring_units",
-            name="Service monitoring",
+            name="Service monitoring (needs write access and API + SSH)",
         ),
     )
 
@@ -595,10 +600,35 @@ class ProxmoxEndpointForm(ProxmoxEndpointSSHCredentialFormMixin, NetBoxModelForm
         self._preserve_primary_secrets()
 
         self._validate_primary_credentials()
-        self._clean_ssh_credentials()
+        if not self._ssh_input_ignored():
+            self._clean_ssh_credentials()
         self._clean_service_monitoring()
         self._validate_storage_prerequisites()
+        self._discard_ssh_input_when_api_only()
         return cleaned_data
+
+    def _ssh_input_ignored(self) -> bool:
+        """Return whether the submitted access method makes SSH input irrelevant."""
+        return self.cleaned_data.get("access_methods") == ProxmoxAccessMethodChoices.API
+
+    def _discard_ssh_input_when_api_only(self) -> None:
+        """Ignore every SSH input, and its errors, for an API-only endpoint.
+
+        API-only endpoints never use SSH, so SSH fields must not block saving.
+        Dropping the keys from ``cleaned_data`` also keeps the model from
+        copying submitted values onto the instance, so stored SSH settings
+        stay untouched until the access method is switched to API + SSH. The two
+        "clear stored SSH secret" requests are explicit operator intent rather
+        than SSH configuration, so they are still honored: a stored SSH secret
+        can be removed while switching an endpoint to API only.
+        """
+        if not self._ssh_input_ignored():
+            return
+        for name in ProxmoxEndpointSSHCredentialFormMixin.ssh_credential_field_names:
+            if name in ProxmoxEndpointSSHCredentialFormMixin.ssh_clear_field_names:
+                continue
+            self._errors.pop(name, None)
+            self.cleaned_data.pop(name, None)
 
     def _preserve_primary_secrets(self) -> None:
         """Preserve masked secrets without requesting an absent unused method."""

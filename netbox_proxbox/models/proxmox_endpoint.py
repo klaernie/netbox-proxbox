@@ -1173,10 +1173,6 @@ class ProxmoxEndpoint(EndpointBase):
             allow_writes=bool(self.allow_writes),
             storage_backend=self.credential_storage_backend or None,
         )
-        if self.ssh_known_host_fingerprint:
-            self.ssh_known_host_fingerprint = normalize_fingerprint(
-                self.ssh_known_host_fingerprint
-            )
         if self.service_monitoring_enabled and not self.service_monitoring_eligible:
             if self._should_auto_disable_service_monitoring_for_rpc():
                 self.service_monitoring_enabled = False
@@ -1190,6 +1186,19 @@ class ProxmoxEndpoint(EndpointBase):
                 raise ValidationError(
                     {"__all__": SERVICE_MONITORING_INELIGIBLE_MESSAGE}
                 )
+        if not self.ssh_access_enabled:
+            # API-only endpoints never use SSH, so stored or submitted SSH
+            # fields must not block saving them. Full validation runs again
+            # when the access method is switched to API + SSH.
+            return
+        self._validate_ssh_configuration()
+
+    def _validate_ssh_configuration(self) -> None:
+        """Validate the SSH fallback fields of an endpoint that permits SSH."""
+        if self.ssh_known_host_fingerprint:
+            self.ssh_known_host_fingerprint = normalize_fingerprint(
+                self.ssh_known_host_fingerprint
+            )
         if self.ssh_credential_source == SSH_CRED_SOURCE_REUSE:
             self._validate_reused_ssh_credentials()
             return

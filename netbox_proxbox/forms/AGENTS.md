@@ -27,7 +27,7 @@ field errors or false readiness, never uncaught form-validation exceptions.
   boundaries with NetBox's `DatePicker`, and the four event-kind toggles.
 - [`__init__.py`](./__init__.py): re-exports all concrete form classes.
 - [`proxmox.py`](./proxmox.py): create/edit and filter forms for
-  `ProxmoxEndpoint`, including the Access control fieldset's broad
+  `ProxmoxEndpoint`, including the **Write access (opt-in)** fieldset's broad
   `allow_writes` gate and separate default-off
   `allow_packer_template_builds` capability.
 - [`netbox.py`](./netbox.py): create/edit and filter forms for `NetBoxEndpoint`, including local validation for token version selection.
@@ -119,10 +119,24 @@ Each endpoint type has an `ImportForm` (e.g. `ProxmoxEndpointImportForm`, `NetBo
   write-only input encrypted with the plugin key; blank edit inputs preserve
   existing ciphertext.
 - Password and token_value fields on `ProxmoxEndpointForm` use `PasswordInput(render_value=False)` and are preserved from the stored instance when the user submits a blank value (edit-without-change UX).
-- `ProxmoxEndpointForm` exposes the broad `allow_writes` gate and the separate
-  default-off `allow_packer_template_builds` capability in its **Access control**
-  fieldset so operators make both trust assertions explicitly in the normal
-  add/edit form.
+- `ProxmoxEndpointForm` separates read-only configuration from write-enabled
+  configuration. **Connection and credentials (read-only API access)** is always
+  shown. The broad `allow_writes` gate and the separate default-off
+  `allow_packer_template_builds` capability sit in **Write access (opt-in)**,
+  `access_methods` in **Access methods**, the SSH fields in **SSH credential
+  access (API + SSH only)**, and service monitoring in its own fieldset, so
+  operators make each trust assertion explicitly in the normal add/edit form.
+  `proxmoxendpoint_edit.html` plus `static/.../proxmox-endpoint-form.js` hide the
+  dependent sections until they apply (CSS class only, never `disabled`, so a
+  hidden field still posts; a section with an error or a checked option stays
+  visible; no script means everything is visible; browser constraint validation is off while a section is hidden so a hidden required field cannot block submission).
+- **API-only endpoints ignore SSH input.** When the submitted `access_methods`
+  is `api`, `ProxmoxEndpointForm.clean()` skips SSH validation and drops every SSH
+  field and SSH field error from `cleaned_data`/`_errors` as its last step, so SSH values can
+  neither block saving nor be copied onto the instance. `ProxmoxEndpoint.clean()`
+  applies the same rule through `ssh_access_enabled`. The explicit "clear stored SSH password/private key" requests are operator intent, not SSH configuration, so they survive the discard and the script keeps their section visible while checked. Full SSH validation runs
+  again for `api_ssh`. `ProxmoxEndpointSSHSettingsForm` (the dedicated SSH tab)
+  is unchanged and always validates.
 - Endpoint-level browser-terminal SSH fields are shared between
   `ProxmoxEndpointForm` and `ProxmoxEndpointSSHSettingsForm` through
   `ProxmoxEndpointSSHCredentialFormMixin`. The selector

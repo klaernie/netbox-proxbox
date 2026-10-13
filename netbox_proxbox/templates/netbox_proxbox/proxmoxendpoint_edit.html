@@ -1,0 +1,14 @@
+{% extends 'generic/object_edit.html' %}
+{% load static %}
+
+{% comment %}
+Add/edit form for Proxmox endpoints. The standard NetBox form body is kept so
+custom fields, ownership, and the changelog message still render. The script
+hides write-only and SSH-only sections until they apply; without scripting every
+section stays visible.
+{% endcomment %}
+
+{% block content %}
+  {{ block.super }}
+  <script src="{% static 'netbox_proxbox/js/proxmox-endpoint-form.js' %}"></script>
+{% endblock content %}
