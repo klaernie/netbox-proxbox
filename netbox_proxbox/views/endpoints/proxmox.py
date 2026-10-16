@@ -68,6 +68,8 @@ from netbox_proxbox.services.backend_context import (
     _build_request_candidates,
     get_fastapi_endpoint_with_token,
 )
+from netbox_proxbox.services.endpoint_enabled import endpoint_is_enabled
+from netbox_proxbox.schemas.backend_proxy import BackendRequestContext
 from netbox_proxbox.tables import ProxmoxEndpointTable
 from netbox_proxbox.utils import encryption as enc_helpers
 from netbox_proxbox.views.proxbox_access import permission_open_ssh_terminal
@@ -607,10 +609,9 @@ class ProxmoxEndpointSSHTerminalSessionView(View):
 
     @sensitive_variables()
     def post(self, request: HttpRequest, pk: int) -> JsonResponse:
-        if not request.user.is_authenticated:
-            return JsonResponse({"error": "Authentication required."}, status=401)
-        if not request.user.has_perm(permission_open_ssh_terminal()):
-            return JsonResponse({"error": "Permission denied."}, status=403)
+        error = self._authorization_error(request)
+        if error is not None:
+            return error
 
         endpoint = get_object_or_404(
             ProxmoxEndpoint.objects.restrict(request.user, "view").restrict(
@@ -618,28 +619,91 @@ class ProxmoxEndpointSSHTerminalSessionView(View):
             ),
             pk=pk,
         )
+        if not endpoint_is_enabled(endpoint):
+            return JsonResponse(
+                {"error": "Proxmox endpoint is disabled."},
+                status=409,
+            )
+        parsed, error = self._parse_terminal_request(request)
+        if error is not None:
+            return error
+        body, cols, rows = parsed
+        backend_payload = self._base_terminal_payload(
+            request,
+            endpoint,
+            body,
+            cols=cols,
+            rows=rows,
+        )
+        error = self._apply_terminal_target(
+            request,
+            endpoint,
+            body,
+            backend_payload,
+        )
+        if error is not None:
+            return error
+        return self._start_terminal_session(backend_payload)
+
+    def _authorization_error(self, request: HttpRequest) -> JsonResponse | None:
+        """Return the first terminal-session authorization failure."""
+        if not request.user.is_authenticated:
+            return JsonResponse({"error": "Authentication required."}, status=401)
+        if not request.user.has_perm(permission_open_ssh_terminal()):
+            return JsonResponse({"error": "Permission denied."}, status=403)
+        return None
+
+    @sensitive_variables()
+    def _parse_terminal_request(
+        self,
+        request: HttpRequest,
+    ) -> tuple[tuple[dict[str, object], int, int], JsonResponse | None]:
+        """Decode the request body and clamp its terminal dimensions."""
         try:
             body = json.loads(request.body.decode() or "{}")
         except json.JSONDecodeError:
-            return JsonResponse({"error": "Invalid JSON payload."}, status=400)
+            return ({}, 0, 0), JsonResponse(
+                {"error": "Invalid JSON payload."}, status=400
+            )
 
         try:
             cols = max(20, min(400, int(body.get("cols") or 120)))
             rows = max(5, min(200, int(body.get("rows") or 32)))
         except (TypeError, ValueError):
-            return JsonResponse({"error": "Invalid terminal size."}, status=400)
+            return ({}, 0, 0), JsonResponse(
+                {"error": "Invalid terminal size."}, status=400
+            )
+        return (body, cols, rows), None
 
-        target_type = body.get("target_type")
-        credential = body.get("credential")
-        store = bool(body.get("store"))
-        backend_payload = {
-            "target_type": target_type,
+    def _base_terminal_payload(
+        self,
+        request: HttpRequest,
+        endpoint: ProxmoxEndpoint,
+        body: dict[str, object],
+        *,
+        cols: int,
+        rows: int,
+    ) -> dict[str, object]:
+        """Build the backend payload fields shared by every terminal target."""
+        return {
+            "target_type": body.get("target_type"),
             "endpoint_id": endpoint.pk,
             "actor": getattr(request.user, "username", "") or str(request.user),
             "cols": cols,
             "rows": rows,
         }
 
+    @sensitive_variables()
+    def _apply_terminal_target(
+        self,
+        request: HttpRequest,
+        endpoint: ProxmoxEndpoint,
+        body: dict[str, object],
+        backend_payload: dict[str, object],
+    ) -> JsonResponse | None:
+        """Validate and apply the selected endpoint or node target."""
+        target_type = body.get("target_type")
+        credential = body.get("credential")
         # A credential typed into the modal (store OR one-shot) opens SSH from the
         # inline material, bypassing the plugin's stored-credential access gate, so
         # enforce the endpoint's SSH access method here explicitly.
@@ -655,56 +719,93 @@ class ProxmoxEndpointSSHTerminalSessionView(View):
             )
 
         if target_type == "node":
-            node_id = body.get("node_id")
-            node = ProxmoxNode.objects.filter(endpoint=endpoint, pk=node_id).first()
-            if node is None:
-                return JsonResponse(
-                    {"error": "Node not found for endpoint."}, status=404
-                )
-            backend_payload["node_id"] = node.pk
-            backend_payload["host"] = node.ip_address
-            if credential is not None:
-                error = self._apply_node_credential(
-                    request, node, credential, store, backend_payload
-                )
-                if error is not None:
-                    return error
-        elif target_type == "endpoint":
-            if credential is not None:
-                if store:
-                    return JsonResponse(
-                        {
-                            "error": (
-                                "Store endpoint SSH credentials from the endpoint's "
-                                "SSH settings tab, not the terminal modal."
-                            )
-                        },
-                        status=400,
+            return self._apply_node_target(request, endpoint, body, backend_payload)
+        if target_type == "endpoint":
+            return self._apply_endpoint_target(endpoint, body, backend_payload)
+        return JsonResponse({"error": "Unsupported terminal target."}, status=400)
+
+    @sensitive_variables()
+    def _apply_node_target(
+        self,
+        request: HttpRequest,
+        endpoint: ProxmoxEndpoint,
+        body: dict[str, object],
+        backend_payload: dict[str, object],
+    ) -> JsonResponse | None:
+        """Resolve a node target and apply optional modal credentials."""
+        node = ProxmoxNode.objects.filter(
+            endpoint=endpoint,
+            pk=body.get("node_id"),
+        ).first()
+        if node is None:
+            return JsonResponse({"error": "Node not found for endpoint."}, status=404)
+        backend_payload["node_id"] = node.pk
+        backend_payload["host"] = node.ip_address
+        credential = body.get("credential")
+        if credential is None:
+            return None
+        return self._apply_node_credential(
+            request,
+            node,
+            credential,
+            bool(body.get("store")),
+            backend_payload,
+        )
+
+    @sensitive_variables()
+    def _apply_endpoint_target(
+        self,
+        endpoint: ProxmoxEndpoint,
+        body: dict[str, object],
+        backend_payload: dict[str, object],
+    ) -> JsonResponse | None:
+        """Apply stored or one-shot credentials to an endpoint target."""
+        credential = body.get("credential")
+        if credential is None:
+            return self._apply_stored_endpoint_target(endpoint, backend_payload)
+        if body.get("store"):
+            return JsonResponse(
+                {
+                    "error": (
+                        "Store endpoint SSH credentials from the endpoint's "
+                        "SSH settings tab, not the terminal modal."
                     )
-                host = (endpoint.ssh_host or "").strip()
-                if not host:
-                    return JsonResponse(
-                        {"error": "Endpoint has no resolvable SSH host."},
-                        status=422,
-                    )
-                data, error = validate_terminal_credential(credential)
-                if error is not None:
-                    return JsonResponse({"error": error}, status=400)
-                backend_payload["host"] = host
-                backend_payload["one_shot_credential"] = one_shot_payload(data)
-            else:
-                if not endpoint.has_ssh_terminal_credentials:
-                    return JsonResponse(
-                        {
-                            "error": (
-                                "Endpoint SSH fallback credentials are not configured."
-                            )
-                        },
-                        status=409,
-                    )
-                backend_payload["host"] = endpoint.ssh_host
-        else:
-            return JsonResponse({"error": "Unsupported terminal target."}, status=400)
+                },
+                status=400,
+            )
+        host = (endpoint.ssh_host or "").strip()
+        if not host:
+            return JsonResponse(
+                {"error": "Endpoint has no resolvable SSH host."},
+                status=422,
+            )
+        data, error = validate_terminal_credential(credential)
+        if error is not None:
+            return JsonResponse({"error": error}, status=400)
+        backend_payload["host"] = host
+        backend_payload["one_shot_credential"] = one_shot_payload(data)
+        return None
+
+    def _apply_stored_endpoint_target(
+        self,
+        endpoint: ProxmoxEndpoint,
+        backend_payload: dict[str, object],
+    ) -> JsonResponse | None:
+        """Apply configured endpoint fallback credentials to the payload."""
+        if not endpoint.has_ssh_terminal_credentials:
+            return JsonResponse(
+                {"error": "Endpoint SSH fallback credentials are not configured."},
+                status=409,
+            )
+        backend_payload["host"] = endpoint.ssh_host
+        return None
+
+    @sensitive_variables()
+    def _start_terminal_session(
+        self,
+        backend_payload: dict[str, object],
+    ) -> JsonResponse:
+        """Resolve proxbox-api authority and request one terminal session."""
 
         fastapi_endpoint, context = get_fastapi_endpoint_with_token()
         if fastapi_endpoint is None or context is None or not context.http_url:
@@ -720,7 +821,23 @@ class ProxmoxEndpointSSHTerminalSessionView(View):
             "ssh/sessions",
             context.verify_ssl,
         )
+        response, error = self._request_terminal_session(
+            candidates,
+            backend_payload,
+            headers,
+        )
+        if error is not None:
+            return error
+        return self._terminal_session_response(response, fastapi_endpoint, context)
 
+    @sensitive_variables()
+    def _request_terminal_session(
+        self,
+        candidates: list[tuple[str, bool]],
+        backend_payload: dict[str, object],
+        headers: dict[str, str],
+    ) -> tuple[requests.Response | None, JsonResponse | None]:
+        """Try each trusted proxbox-api URL until one returns a response."""
         last_error = "Unable to reach proxbox-api."
         for url, verify_ssl in candidates:
             try:
@@ -735,42 +852,48 @@ class ProxmoxEndpointSSHTerminalSessionView(View):
             except requests.RequestException as exc:
                 last_error = str(exc)
                 continue
-            if response.status_code >= 400:
-                return JsonResponse(
-                    {
-                        "error": response.text
-                        or "proxbox-api rejected terminal session."
-                    },
-                    status=response.status_code if response.status_code < 500 else 502,
-                )
-            try:
-                data = response.json()
-            except ValueError:
-                return JsonResponse(
-                    {"error": "proxbox-api returned a non-JSON terminal response."},
-                    status=502,
-                )
-            websocket_base = context.detail.get("websocket_url") or getattr(
-                fastapi_endpoint, "websocket_url", ""
-            )
-            if not websocket_base:
-                return JsonResponse(
-                    {"error": "FastAPI endpoint WebSocket URL is not configured."},
-                    status=503,
-                )
-            return JsonResponse(
-                {
-                    "session_id": data.get("session_id"),
-                    "ticket": data.get("ticket"),
-                    "websocket_url": _terminal_websocket_url(
-                        str(websocket_base),
-                        str(data.get("websocket_path") or ""),
-                    ),
-                    "expires_at": data.get("expires_at"),
-                }
-            )
+            return response, None
+        return None, JsonResponse({"error": last_error}, status=502)
 
-        return JsonResponse({"error": last_error}, status=502)
+    @sensitive_variables()
+    def _terminal_session_response(
+        self,
+        response: requests.Response,
+        fastapi_endpoint: object,
+        context: BackendRequestContext,
+    ) -> JsonResponse:
+        """Validate and expose the allowlisted terminal-session response."""
+        if response.status_code >= 400:
+            return JsonResponse(
+                {"error": response.text or "proxbox-api rejected terminal session."},
+                status=response.status_code if response.status_code < 500 else 502,
+            )
+        try:
+            data = response.json()
+        except ValueError:
+            return JsonResponse(
+                {"error": "proxbox-api returned a non-JSON terminal response."},
+                status=502,
+            )
+        websocket_base = context.detail.get("websocket_url") or getattr(
+            fastapi_endpoint, "websocket_url", ""
+        )
+        if not websocket_base:
+            return JsonResponse(
+                {"error": "FastAPI endpoint WebSocket URL is not configured."},
+                status=503,
+            )
+        return JsonResponse(
+            {
+                "session_id": data.get("session_id"),
+                "ticket": data.get("ticket"),
+                "websocket_url": _terminal_websocket_url(
+                    str(websocket_base),
+                    str(data.get("websocket_path") or ""),
+                ),
+                "expires_at": data.get("expires_at"),
+            }
+        )
 
     @sensitive_variables()
     def _apply_node_credential(

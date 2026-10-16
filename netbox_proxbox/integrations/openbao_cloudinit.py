@@ -61,6 +61,7 @@ class PendingCloudInitSecret:
 class CloudInitMaterialContext:
     """Prelocked owner, VM, assignment, credential, and policy graph."""
 
+    settings: Any
     owners: dict[int, Any]
     virtual_machines: dict[int, Any]
     assignments: dict[int, list[Any]]
@@ -82,6 +83,17 @@ class CloudInitMaterialContext:
             return
         raise ValidationError(
             "Cloud-init credential ownership was not declared before material access."
+        )
+
+    def validate_openbao_storage(self) -> None:
+        """Revalidate the locked plugin selection before provider writes."""
+        from .openbao import validate_locked_openbao_storage
+
+        validate_locked_openbao_storage(
+            self.settings,
+            conflict_message=(
+                "Cloud-init material cannot be written while legacy storage is selected."
+            ),
         )
 
 
@@ -405,7 +417,7 @@ def _declare_context(
     from .openbao import _default_policy
     from .openbao_single_transaction import _locked_settings
 
-    _locked_settings()
+    settings = _locked_settings()
     locked_owners = _lock_owners(owners)
     all_vm_ids = vm_ids | {
         int(owner.virtual_machine_id) for owner in locked_owners.values()
@@ -427,6 +439,7 @@ def _declare_context(
             "The default OpenBao policy changed during ownership acquisition."
         )
     return CloudInitMaterialContext(
+        settings=settings,
         owners=locked_owners,
         virtual_machines=virtual_machines,
         assignments=assignments,
@@ -810,6 +823,7 @@ def _save_with_context(
     references: dict[str, Any],
 ) -> Any:
     context.admit(owner)
+    context.validate_openbao_storage()
     previous = context.owners.get(int(owner.pk)) if owner.pk is not None else None
     if previous is not None:
         _validate_references(owner, previous)

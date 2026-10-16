@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from pathlib import Path
 import sys
@@ -71,6 +73,8 @@ from users.models import ObjectPermission  # noqa: E402
 import netbox_proxbox.websocket_client as websocket_module  # noqa: E402
 from netbox_proxbox.models import FastAPIEndpoint  # noqa: E402
 
+_REAL_SEND_MESSAGE = websocket_module.send_message
+
 
 class WebSocketSyncRouteTests(TestCase):
     """GET is read-only; POST needs CSRF plus the job-enqueue permission."""
@@ -108,7 +112,15 @@ class WebSocketSyncRouteTests(TestCase):
                 lambda command, **_kw: self.sent.append(command),
             ),
             patch.object(
+                websocket_module, "_backend_supports_ws_run_id", return_value=False
+            ),
+            patch.object(
                 websocket_module, "websocket_task_identity", (1, "test-identity")
+            ),
+            patch.object(
+                websocket_module,
+                "websocket_connection_identity",
+                (1, "test-identity", "test-connection"),
             ),
             patch.dict(
                 websocket_module.ws_sync_button_state,
@@ -118,12 +130,28 @@ class WebSocketSyncRouteTests(TestCase):
                     "virtual-machines": "not-started",
                 },
             ),
+            patch.dict(
+                websocket_module.ws_sync_run_id,
+                {
+                    "full-update": None,
+                    "devices": None,
+                    "virtual-machines": None,
+                },
+            ),
         )
         for active in patches:
             active.start()
             self.addCleanup(active.stop)
         websocket_module.GLOBAL_WEBSOCKET_MESSAGES.clear()
         self.addCleanup(websocket_module.GLOBAL_WEBSOCKET_MESSAGES.clear)
+        while not websocket_module.message_queue.empty():
+            websocket_module.message_queue.get_nowait()
+        self.addCleanup(self._clear_command_queue)
+
+    @staticmethod
+    def _clear_command_queue() -> None:
+        while not websocket_module.message_queue.empty():
+            websocket_module.message_queue.get_nowait()
 
     @staticmethod
     def _url(kind: str) -> str:
@@ -174,6 +202,127 @@ class WebSocketSyncRouteTests(TestCase):
         self.assertEqual(first.json()["queued"], True)
         self.assertEqual(second.status_code, 409)
         self.assertEqual(self.sent, ["Sync Nodes"])
+
+    def test_post_returns_the_correlated_run_id(self) -> None:
+        client = self._client(self.operator)
+        token = self._csrf_token(client)
+        run_id = "0123456789abcdef0123456789abcdef"
+
+        with (
+            patch.object(
+                websocket_module, "_backend_supports_ws_run_id", return_value=True
+            ),
+            patch.object(websocket_module, "send_message", return_value=run_id),
+        ):
+            response = client.post(self._url("full-update"), HTTP_X_CSRFTOKEN=token)
+            attached = client.post(self._url("full-update"), HTTP_X_CSRFTOKEN=token)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["run_id"], run_id)
+        self.assertEqual(attached.status_code, 409)
+        self.assertEqual(attached.json()["run_id"], run_id)
+        self.assertEqual(websocket_module.ws_sync_run_id["full-update"], run_id)
+
+    def test_post_dispatch_downgrade_and_polling_share_run_metadata(self) -> None:
+        client = self._client(self.operator)
+        token = self._csrf_token(client)
+
+        with (
+            patch.object(websocket_module, "send_message", _REAL_SEND_MESSAGE),
+            patch.object(
+                websocket_module,
+                "_backend_supports_ws_run_id",
+                return_value=True,
+            ),
+        ):
+            response = client.post(self._url("devices"), HTTP_X_CSRFTOKEN=token)
+
+        run_id = response.json()["run_id"]
+        queued = websocket_module.message_queue.get_nowait()
+
+        async def trusted_credentials(_endpoint_id: int, _identity: str) -> object:
+            return object()
+
+        with (
+            patch.object(
+                websocket_module,
+                "_backend_supports_ws_run_id",
+                return_value=False,
+            ),
+            patch.object(
+                websocket_module,
+                "_reload_credentials",
+                side_effect=trusted_credentials,
+            ),
+        ):
+            frame, pending = asyncio.run(
+                websocket_module._dispatch_queued_command(
+                    queued,
+                    1,
+                    "test-identity",
+                    "test-connection",
+                )
+            )
+        terminal = '{"object":"device","end":true}'
+        websocket_module.publish_backend_message(terminal, endpoint_id=1)
+        polled = client.get(
+            self._url("devices"),
+            {
+                "json_response": "true",
+                "after": response.json()["cursor"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(frame, "Sync Nodes")
+        self.assertIsNone(pending)
+        self.assertEqual(
+            [json.loads(message) for message in polled.json()],
+            [
+                {"object": "sync-run", "run_id": run_id, "correlated": False},
+                {"object": "device", "end": True},
+            ],
+        )
+
+    def test_post_without_an_authenticated_connection_queues_legacy(self) -> None:
+        client = self._client(self.operator)
+        token = self._csrf_token(client)
+
+        with (
+            patch.object(websocket_module, "websocket_connection_identity", None),
+            patch.object(
+                websocket_module,
+                "_backend_supports_ws_run_id",
+                side_effect=AssertionError("capability probe must not run"),
+            ),
+        ):
+            response = client.post(self._url("devices"), HTTP_X_CSRFTOKEN=token)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertNotIn("run_id", response.json())
+        self.assertEqual(self.sent, ["Sync Nodes"])
+
+    def test_post_refuses_a_connection_change_during_capability_probe(self) -> None:
+        client = self._client(self.operator)
+        token = self._csrf_token(client)
+
+        def replace_connection(*_args, **_kwargs) -> bool:
+            websocket_module.websocket_connection_identity = (
+                1,
+                "test-identity",
+                "replacement-connection",
+            )
+            return True
+
+        with patch.object(
+            websocket_module,
+            "_backend_supports_ws_run_id",
+            side_effect=replace_connection,
+        ):
+            response = client.post(self._url("devices"), HTTP_X_CSRFTOKEN=token)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.sent, [])
 
     def test_unknown_kind_is_not_found(self) -> None:
         client = self._client(self.operator)
@@ -353,6 +502,16 @@ class WebSocketStateTransitionTests(TestCase):
         )
         state.start()
         self.addCleanup(state.stop)
+        run_ids = patch.dict(
+            websocket_module.ws_sync_run_id,
+            {
+                "full-update": None,
+                "devices": None,
+                "virtual-machines": None,
+            },
+        )
+        run_ids.start()
+        self.addCleanup(run_ids.stop)
 
     def test_device_terminal_keeps_a_running_full_update_latched(self) -> None:
         sequence = websocket_module.publish_backend_message(
@@ -406,10 +565,22 @@ class WebSocketStateTransitionTests(TestCase):
         )
 
         self.assertIsNone(
-            websocket_module._command_for_worker(foreign, 2, "new-identity")
+            websocket_module._command_for_worker(
+                foreign,
+                2,
+                "new-identity",
+                connection_id="new-connection",
+                supports_run_id=False,
+            )
         )
         self.assertIsNone(
-            websocket_module._command_for_worker("Sync Nodes", 1, "old-identity")
+            websocket_module._command_for_worker(
+                "Sync Nodes",
+                1,
+                "old-identity",
+                connection_id="old-connection",
+                supports_run_id=False,
+            )
         )
         self.assertEqual(
             websocket_module.ws_sync_button_state["devices"], "not-started"
@@ -421,7 +592,14 @@ class WebSocketStateTransitionTests(TestCase):
         )
 
         self.assertEqual(
-            websocket_module._command_for_worker(own, 2, "identity"), "Full Update"
+            websocket_module._command_for_worker(
+                own,
+                2,
+                "identity",
+                connection_id="connection",
+                supports_run_id=False,
+            ),
+            "Full Update",
         )
 
     def test_idle_sync_latch_expires_instead_of_locking_out_syncs(self) -> None:

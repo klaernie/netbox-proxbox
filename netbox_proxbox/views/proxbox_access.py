@@ -4,9 +4,17 @@ from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.mixins import AccessMixin
 from django.contrib.auth.models import AnonymousUser
 from django.http import HttpRequest, HttpResponse
+from utilities.views import ContentTypePermissionRequiredMixin
 
 from core.models import Job
 from utilities.permissions import get_permission_for_model
+
+from netbox_proxbox.operational_security import (
+    LEGACY_PROXMOX_ACTION_PERMISSION,
+    endpoint_action_is_authorized,
+    request_token_allows_write,
+    user_has_any_operational_permission,
+)
 
 from netbox_proxbox.models import (
     DeletionRequest,
@@ -19,6 +27,9 @@ from netbox_proxbox.models import (
 
 __all__ = (
     "RequireProxboxDashboardAccessMixin",
+    "EndpointOperationalPermissionRequiredMixin",
+    "TokenWriteScopeRequiredMixin",
+    "ENDPOINT_OPERATIONAL_ACTION",
     "permission_authorize_deletion_request",
     "permission_change_fastapi_endpoint",
     "permission_change_proxbox_plugin_settings",
@@ -34,14 +45,61 @@ __all__ = (
     "permission_reset_encrypted_secrets",
     "permission_run_endpoint_action",
     "permission_run_proxmox_action",
+    "request_token_allows_write",
+    "user_can_run_endpoint_action",
+    "user_has_any_endpoint_action",
     "permission_view_fastapi_endpoint",
     "user_may_access_proxbox_dashboard",
 )
 
-PROXMOX_ACTION_PERMISSION = "core.run_proxmox_action"
+PROXMOX_ACTION_PERMISSION = LEGACY_PROXMOX_ACTION_PERMISSION
 ENDPOINT_OPERATIONAL_ACTION = "run_proxmox_action"
 SSH_TERMINAL_ACTION = "open_ssh_terminal"
 CONSOLE_ACTION = "open_console"
+TOKEN_WRITE_REQUIRED_MESSAGE = "API token does not allow write operations."
+
+
+class TokenWriteScopeRequiredMixin:
+    """Reject unsafe requests authenticated by a read-only API token."""
+
+    def dispatch(
+        self, request: HttpRequest, *args: object, **kwargs: object
+    ) -> HttpResponse:
+        if request.method not in {
+            "GET",
+            "HEAD",
+            "OPTIONS",
+        } and not request_token_allows_write(request):
+            return HttpResponse(TOKEN_WRITE_REQUIRED_MESSAGE, status=403)
+        return super().dispatch(request, *args, **kwargs)
+
+
+def user_has_any_endpoint_action(user: object) -> bool:
+    """Return whether the actor has a current or deprecated operational grant."""
+    return user_has_any_operational_permission(
+        user,
+        permission_run_endpoint_action(),
+    )
+
+
+def user_can_run_endpoint_action(user: object, endpoint_id: object) -> bool:
+    """Authorize one endpoint through object scope or the deprecated legacy grant."""
+    return endpoint_action_is_authorized(
+        user,
+        endpoint_id,
+        endpoint_objects=ProxmoxEndpoint.objects,
+        endpoint_action=ENDPOINT_OPERATIONAL_ACTION,
+    )
+
+
+class EndpointOperationalPermissionRequiredMixin(ContentTypePermissionRequiredMixin):
+    """Gate views on any grant, before their endpoint-specific scope check."""
+
+    def get_required_permission(self) -> str:
+        return permission_run_endpoint_action()
+
+    def has_permission(self) -> bool:
+        return user_has_any_endpoint_action(self.request.user)
 
 
 class RequireProxboxDashboardAccessMixin(AccessMixin):
@@ -83,11 +141,11 @@ def permission_enqueue_proxbox_sync() -> str:
 
 
 def permission_run_proxmox_action() -> str:
-    """Required to dispatch operational verbs (start/stop/snapshot/migrate) via proxbox-api.
+    """Return the deprecated literal operational permission compatibility name.
 
-    Single permission gates all four verbs. Pair with ``ProxmoxEndpoint.allow_writes``
-    on the target endpoint — both must be true for the verb to dispatch. See
-    ``docs/design/operational-verbs.md`` for the full contract.
+    New grants must use ``permission_run_endpoint_action()`` and exact endpoint
+    scoping. Existing authentication backends that already yield this literal
+    remain accepted additively during the compatibility transition.
     """
     return PROXMOX_ACTION_PERMISSION
 

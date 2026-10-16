@@ -117,9 +117,12 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
+        # The cli extra provides aiohttp, which tests/test_cli_*.py and
+        # tests/test_locate_manage.py import through proxbox_cli. Without it
+        # the mocked suite fails at collection with ModuleNotFoundError.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[test,e2e]"
+          python -m pip install -e ".[test,e2e,cli]"
 
       - name: Run mocked test suite
         # -p no:django: this suite runs against the Django/NetBox stubs in

@@ -14,19 +14,25 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from virtualization.models import VirtualMachine
 
+from netbox_proxbox.api.operational_permissions import (
+    EndpointOperationalActionPermission,
+    TokenWriteScopePermission,
+)
 from netbox_proxbox.services.backend_path import (
     UnsafeBackendPathSegment,
     safe_vm_type,
     safe_vmid,
 )
 from netbox_proxbox.services._endpoint_errors import translate_request_exception
-from netbox_proxbox.services.backend_context import get_fastapi_request_context
+from netbox_proxbox.services.operational_target import (
+    OperationalTargetError,
+    resolve_operational_target,
+)
 from netbox_proxbox.utils import resolve_vm_type
 from netbox_proxbox.views.operational import (
     _current_node_name,
     resolve_vm_endpoint_context,
 )
-from netbox_proxbox.views.proxbox_access import permission_run_proxmox_action
 
 _BACKEND_TIMEOUT_S = 30
 VmKind = Literal["qemu", "lxc"]
@@ -107,39 +113,40 @@ def _forward_tags_request(
     method: str,
     payload: dict[str, Any],
 ) -> Response:
-    if not request.user.has_perm(permission_run_proxmox_action()):
-        return Response(
-            {
-                "status": "error",
-                "reason": "permission_denied",
-                "detail": "Missing core.run_proxmox_action permission.",
-            },
-            status=status.HTTP_403_FORBIDDEN,
-        )
-
     ctx_result = _resolve_tags_context(vm)
     if isinstance(ctx_result, Response):
         return ctx_result
     endpoint_id, vmid, vm_type, node = ctx_result
-
-    ctx = get_fastapi_request_context()
-    if ctx is None or not ctx.http_url:
-        return Response(
-            {"detail": "No FastAPI backend endpoint is configured."},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
     body = {"node": node, **payload}
     try:
-        url = (
-            f"{ctx.http_url.rstrip('/')}/proxmox/"
-            f"{safe_vm_type(vm_type)}/{safe_vmid(vmid)}/tags"
-        )
+        vm_type_segment = safe_vm_type(vm_type)
+        vmid_segment = safe_vmid(vmid)
     except UnsafeBackendPathSegment:
         return Response(
             {"detail": "The guest type or VM ID is not a valid Proxmox identifier."},
             status=status.HTTP_400_BAD_REQUEST,
         )
+    sync_state = getattr(vm, "proxbox_sync_state", None)
+    endpoint = getattr(sync_state, "endpoint", None)
+    if endpoint is None or getattr(endpoint, "pk", None) != endpoint_id:
+        return Response(
+            {"detail": "The VM's Proxmox endpoint identity is inconsistent."},
+            status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+    try:
+        target = resolve_operational_target(
+            endpoint=endpoint,
+            user=request.user,
+            timeout=_BACKEND_TIMEOUT_S,
+        )
+    except OperationalTargetError as exc:
+        return Response(
+            {"status": "error", "reason": exc.reason, "detail": exc.detail},
+            status=exc.status_code,
+        )
+
+    ctx = target.context
+    url = f"{ctx.http_url.rstrip('/')}/proxmox/{vm_type_segment}/{vmid_segment}/tags"
     headers = dict(ctx.headers or {})
     headers.setdefault("Content-Type", "application/json")
     headers["X-Proxbox-Actor"] = _actor_from_request(request)
@@ -149,7 +156,7 @@ def _forward_tags_request(
         response = requests.request(
             method,
             url,
-            params={"endpoint_id": endpoint_id},
+            params={"endpoint_id": target.backend_endpoint_id},
             json=body,
             headers=headers,
             timeout=_BACKEND_TIMEOUT_S,
@@ -182,7 +189,7 @@ def _forward_tags_request(
             "ok": True,
             "vmid": upstream.get("vmid", vmid),
             "vm_type": upstream.get("vm_type", vm_type),
-            "endpoint_id": upstream.get("endpoint_id", endpoint_id),
+            "endpoint_id": target.backend_endpoint_id,
             "node": upstream.get("node", node),
             "tags_after": upstream.get("tags_after", []),
         },
@@ -191,6 +198,10 @@ def _forward_tags_request(
 
 
 class _VirtualMachineProxmoxTagsBase(APIView):
+    permission_classes = [
+        TokenWriteScopePermission,
+        EndpointOperationalActionPermission,
+    ]
     expected_kind: VmKind = "qemu"
 
     @extend_schema(responses={200: OpenApiTypes.OBJECT})

@@ -101,3 +101,12 @@ def test_view_uses_backend_context_helper():
     source = VM_HA_PATH.read_text(encoding="utf-8")
     assert "get_fastapi_request_context" in source
     assert "translate_request_exception" in source
+
+
+def test_view_scopes_backend_lookup_to_the_vm_endpoint():
+    source = VM_HA_PATH.read_text(encoding="utf-8")
+    assert "resolve_vm_endpoint_context(instance)" in source
+    assert "endpoint_ids=[endpoint_id]" in source
+    assert (
+        "endpoint_id not in set(viewable_enabled_endpoint_ids(request.user))" in source
+    )

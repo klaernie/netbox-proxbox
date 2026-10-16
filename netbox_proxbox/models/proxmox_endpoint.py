@@ -40,6 +40,7 @@ from netbox_proxbox.validators import validate_node_device_name_template
 
 
 logger = logging.getLogger(__name__)
+_PENDING_PASSWORD_UNSET = object()
 
 
 class ProxmoxConnectionTuning(TypedDict):
@@ -1173,7 +1174,10 @@ class ProxmoxEndpoint(EndpointBase):
             allow_writes=bool(self.allow_writes),
             storage_backend=self.credential_storage_backend or None,
         )
-        if self.service_monitoring_enabled and not self.service_monitoring_eligible:
+        if (
+            self.service_monitoring_enabled
+            and not self._service_monitoring_eligible_for_validation()
+        ):
             if self._should_auto_disable_service_monitoring_for_rpc():
                 self.service_monitoring_enabled = False
                 logger.warning(
@@ -1192,6 +1196,31 @@ class ProxmoxEndpoint(EndpointBase):
             # when the access method is switched to API + SSH.
             return
         self._validate_ssh_configuration()
+
+    def _service_monitoring_eligible_for_validation(self) -> bool:
+        """Validate monitoring against pending form credentials when present.
+
+        Operational readiness continues to use ``service_monitoring_eligible``
+        and therefore only persisted credential material. This validation-only
+        path lets a write-only password submitted by a ``ModelForm`` satisfy the
+        same save that will persist it.
+        """
+        if self.ssh_credential_source == SSH_CRED_SOURCE_REUSE:
+            password_available, _error = self._reused_password_validation_state()
+            credentials_ready = bool(
+                self.ssh_host
+                and self.ssh_known_host_fingerprint
+                and self.effective_ssh_username
+                and password_available
+            )
+        else:
+            credentials_ready = self.has_ssh_terminal_credentials
+        return bool(
+            self.allow_writes
+            and self.ssh_access_enabled
+            and credentials_ready
+            and self.effective_rpc_enabled()
+        )
 
     def _validate_ssh_configuration(self) -> None:
         """Validate the SSH fallback fields of an endpoint that permits SSH."""
@@ -1231,20 +1260,9 @@ class ProxmoxEndpoint(EndpointBase):
     def _validate_reused_ssh_credentials(self) -> None:
         """Attach unavailable reused passwords to the SSH-source form field."""
         errors: dict[str, str] = {}
-        try:
-            password_available = bool(self.password)
-        except enc_helpers.EncryptionError:
-            password_available = False
-            errors["ssh_credential_source"] = (
-                "The stored endpoint password cannot be decrypted. Enter a "
-                "replacement password or use encrypted-secret recovery."
-            )
-        except ValidationError:
-            password_available = False
-            errors["ssh_credential_source"] = (
-                "The stored endpoint password cannot be resolved. Check the "
-                "configured credential store or enter a replacement password."
-            )
+        password_available, password_error = self._reused_password_validation_state()
+        if password_error is not None:
+            errors["ssh_credential_source"] = password_error
         if not password_available and "ssh_credential_source" not in errors:
             errors["ssh_credential_source"] = (
                 "Reusing endpoint credentials for SSH requires a stored "
@@ -1257,6 +1275,28 @@ class ProxmoxEndpoint(EndpointBase):
             )
         if errors:
             raise ValidationError(errors)
+
+    def _reused_password_validation_state(self) -> tuple[bool, str | None]:
+        """Return pending-or-stored password presence and a safe resolution error."""
+        pending_password = getattr(
+            self,
+            "_pending_password_for_validation",
+            _PENDING_PASSWORD_UNSET,
+        )
+        if pending_password is not _PENDING_PASSWORD_UNSET:
+            return bool(pending_password), None
+        try:
+            return bool(self.password), None
+        except enc_helpers.EncryptionError:
+            return False, (
+                "The stored endpoint password cannot be decrypted. Enter a "
+                "replacement password or use encrypted-secret recovery."
+            )
+        except ValidationError:
+            return False, (
+                "The stored endpoint password cannot be resolved. Check the "
+                "configured credential store or enter a replacement password."
+            )
 
     def effective_overwrites(self) -> dict[str, bool]:
         """Resolve overwrite flags by falling back to the global plugin singleton when NULL."""

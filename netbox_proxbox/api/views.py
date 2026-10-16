@@ -6,6 +6,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import DatabaseError
 from django.db.models import Q
 from django.http import Http404
+from django.shortcuts import get_object_or_404
 from django.views.decorators.debug import sensitive_variables
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
@@ -27,8 +28,17 @@ from netbox_proxbox.intent.firewall_common import (
     FirewallPushError,
     preview_firewall_object,
     push_firewall_object,
+    resolve_firewall_endpoint,
 )
-from netbox_proxbox.views.proxbox_access import permission_run_proxmox_action
+from netbox_proxbox.services.endpoint_enabled import endpoint_is_enabled
+from netbox_proxbox.views.proxbox_access import (
+    user_can_run_endpoint_action,
+)
+
+from .operational_permissions import (
+    EndpointOperationalActionPermission,
+    TokenWriteScopePermission,
+)
 
 from .. import filtersets, models
 from .serializers import (
@@ -107,7 +117,7 @@ from netbox_proxbox.api.build_pve_template import (
 from netbox_proxbox.api.template_build_authorization import (
     TemplateBuildAuthorizationError,
     require_template_build_authorization,
-    resolve_authorized_backend_endpoint_id,
+    resolve_authorized_template_build_target,
 )
 from netbox_proxbox.api.mcp_bridge import (
     build_mcp_bridge_manifest,
@@ -115,6 +125,7 @@ from netbox_proxbox.api.mcp_bridge import (
     mcp_bridge_is_active,
 )
 from netbox_proxbox.services.metrics_influx import MetricsProxyError, query_metrics
+from netbox_proxbox.services.operational_target import OperationalTarget
 from netbox_proxbox.api.connection_authority import ConnectionAuthorityViewSetMixin
 
 
@@ -887,15 +898,8 @@ class _PackerTemplateBuildDeleteConflict(APIException):
     default_code = "packer_template_build_authorization_active"
 
 
-class _PackerTemplateBuildActionPermission(BasePermission):
+class _PackerTemplateBuildActionPermission(EndpointOperationalActionPermission):
     """Require the explicit operational permission before endpoint lookup."""
-
-    def has_permission(self, request: Request, view: object) -> bool:  # type: ignore[override]
-        del view
-        return bool(
-            request.user.is_authenticated
-            and request.user.has_perm(permission_run_proxmox_action())
-        )
 
 
 class ProxmoxEndpointViewSet(ConnectionAuthorityViewSetMixin, NetBoxModelViewSet):
@@ -907,27 +911,37 @@ class ProxmoxEndpointViewSet(ConnectionAuthorityViewSetMixin, NetBoxModelViewSet
     serializer_class = ProxmoxEndpointSerializer
     filterset_class = filtersets.ProxmoxEndpointFilterSet
 
+    def _template_build_endpoint(
+        self, request: Request, pk: int | None
+    ) -> models.ProxmoxEndpoint:
+        """Apply the existing POST scope and the endpoint operational scope."""
+        del pk
+        endpoint = self.get_object()
+        if user_can_run_endpoint_action(request.user, endpoint.pk):
+            return endpoint
+        raise Http404
+
     @staticmethod
     def _template_build_payload(
         request: Request,
         endpoint: models.ProxmoxEndpoint,
-    ) -> tuple[dict[str, object] | None, Response | None]:
+    ) -> tuple[dict[str, object] | None, OperationalTarget | None, Response | None]:
         """Validate local authority and translate NetBox pk to backend identity."""
         try:
             require_template_build_authorization(request.user, endpoint)
         except TemplateBuildAuthorizationError as exc:
-            return None, Response({"detail": exc.detail}, status=exc.status_code)
+            return None, None, Response({"detail": exc.detail}, status=exc.status_code)
 
         serializer = PVETemplateBuildRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            backend_endpoint_id = resolve_authorized_backend_endpoint_id(endpoint)
+            target = resolve_authorized_template_build_target(request.user, endpoint)
         except TemplateBuildAuthorizationError as exc:
-            return None, Response({"detail": exc.detail}, status=exc.status_code)
+            return None, None, Response({"detail": exc.detail}, status=exc.status_code)
 
         payload: dict[str, object] = dict(serializer.validated_data)
-        payload["endpoint_id"] = backend_endpoint_id
-        return payload, None
+        payload["endpoint_id"] = target.backend_endpoint_id
+        return payload, target, None
 
     def perform_destroy(self, instance: models.ProxmoxEndpoint) -> None:
         """Translate the model's revocation invariant to a stable REST conflict."""
@@ -956,7 +970,11 @@ class ProxmoxEndpointViewSet(ConnectionAuthorityViewSetMixin, NetBoxModelViewSet
         methods=["post"],
         url_path="build-pve-template",
         url_name="build-pve-template",
-        permission_classes=[IsAuthenticated, _PackerTemplateBuildActionPermission],
+        permission_classes=[
+            IsAuthenticated,
+            TokenWriteScopePermission,
+            _PackerTemplateBuildActionPermission,
+        ],
     )
     def build_pve_template(self, request: Request, pk: int | None = None) -> Response:
         """Trigger a PVE-installer cloud-init template build via proxbox-api.
@@ -968,12 +986,17 @@ class ProxmoxEndpointViewSet(ConnectionAuthorityViewSetMixin, NetBoxModelViewSet
         The response is the upstream body verbatim — including the rendered
         build script and cloud-init snippets for the target host.
         """
-        endpoint = self.get_object()
-        payload, error_response = self._template_build_payload(request, endpoint)
+        endpoint = self._template_build_endpoint(request, pk)
+        payload, target, error_response = self._template_build_payload(
+            request, endpoint
+        )
         if error_response is not None:
             return error_response
         assert payload is not None
-        body, status_code = build_pve_template_via_backend(payload)
+        assert target is not None
+        body, status_code = build_pve_template_via_backend(
+            payload, context=target.context
+        )
         return Response(body, status=status_code)
 
     @extend_schema(
@@ -992,7 +1015,11 @@ class ProxmoxEndpointViewSet(ConnectionAuthorityViewSetMixin, NetBoxModelViewSet
         methods=["post"],
         url_path="cloud-image-build-pipeline",
         url_name="cloud-image-build-pipeline",
-        permission_classes=[IsAuthenticated, _PackerTemplateBuildActionPermission],
+        permission_classes=[
+            IsAuthenticated,
+            TokenWriteScopePermission,
+            _PackerTemplateBuildActionPermission,
+        ],
     )
     def cloud_image_build_pipeline(
         self,
@@ -1000,12 +1027,17 @@ class ProxmoxEndpointViewSet(ConnectionAuthorityViewSetMixin, NetBoxModelViewSet
         pk: int | None = None,
     ) -> Response:
         """Trigger the Cloud Image Build Pipeline via proxbox-api."""
-        endpoint = self.get_object()
-        payload, error_response = self._template_build_payload(request, endpoint)
+        endpoint = self._template_build_endpoint(request, pk)
+        payload, target, error_response = self._template_build_payload(
+            request, endpoint
+        )
         if error_response is not None:
             return error_response
         assert payload is not None
-        body, status_code = build_cloud_image_pipeline_via_backend(payload)
+        assert target is not None
+        body, status_code = build_cloud_image_pipeline_via_backend(
+            payload, context=target.context
+        )
         return Response(body, status=status_code)
 
 
@@ -2397,43 +2429,46 @@ class _FirewallPushActionMixin:
     """DRF action for pushing one firewall object to Proxmox."""
 
     @extend_schema(responses={200: OpenApiTypes.OBJECT})
-    @action(detail=True, methods=["post"], url_path="push")
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="push",
+        permission_classes=[
+            IsAuthenticated,
+            TokenWriteScopePermission,
+            EndpointOperationalActionPermission,
+        ],
+    )
     def push(self, request: Request, pk: int | str | None = None) -> Response:
         """Push this firewall object to the linked Proxmox endpoint."""
-        if not request.user.has_perm(permission_run_proxmox_action()):
-            return Response(
-                {
-                    "status": "error",
-                    "reason": "permission_denied",
-                    "detail": "Missing core.run_proxmox_action permission.",
-                },
-                status=drf_status.HTTP_403_FORBIDDEN,
-            )
-
+        del pk
         obj = self.get_object()
+        permission_error = _firewall_endpoint_permission_error(request, obj)
+        if permission_error is not None:
+            return permission_error
         actor = _actor_from_request(request)
         try:
-            result = push_firewall_object(obj, actor=actor)
+            result = push_firewall_object(obj, actor=actor, user=request.user)
         except FirewallPushError as exc:
             return _firewall_error_response(exc)
         return Response(result.to_response(), status=drf_status.HTTP_200_OK)
 
     @extend_schema(responses={200: OpenApiTypes.OBJECT})
-    @action(detail=True, methods=["get"], url_path="preview")
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="preview",
+        permission_classes=[IsAuthenticated, EndpointOperationalActionPermission],
+    )
     def preview(self, request: Request, pk: int | str | None = None) -> Response:
         """Return NetBox state, live Proxmox state, and differing fields."""
         del pk
-        if not request.user.has_perm(permission_run_proxmox_action()):
-            return Response(
-                {
-                    "status": "error",
-                    "reason": "permission_denied",
-                    "detail": "Missing core.run_proxmox_action permission.",
-                },
-                status=drf_status.HTTP_403_FORBIDDEN,
-            )
+        obj = self.get_object()
+        permission_error = _firewall_endpoint_permission_error(request, obj)
+        if permission_error is not None:
+            return permission_error
         try:
-            result = preview_firewall_object(self.get_object())
+            result = preview_firewall_object(obj, user=request.user)
         except FirewallPushError as exc:
             # For example an object whose node name is not a valid Proxmox
             # identifier: report it instead of failing with HTTP 500.
@@ -2451,6 +2486,32 @@ def _firewall_error_response(exc: FirewallPushError) -> Response:
             "response": exc.response,
         },
         status=exc.status_code,
+    )
+
+
+def _firewall_endpoint_permission_error(
+    request: Request, obj: object
+) -> Response | None:
+    """Return a fail-closed response unless the object's endpoint is authorized."""
+    endpoint = resolve_firewall_endpoint(obj)
+    if endpoint is not None and not endpoint_is_enabled(endpoint):
+        return Response(
+            {
+                "status": "error",
+                "reason": "endpoint_disabled",
+                "detail": "The linked Proxmox endpoint is disabled.",
+            },
+            status=drf_status.HTTP_403_FORBIDDEN,
+        )
+    if endpoint is not None and user_can_run_endpoint_action(request.user, endpoint.pk):
+        return None
+    return Response(
+        {
+            "status": "error",
+            "reason": "permission_denied",
+            "detail": "Proxmox endpoint is outside the operational permission scope.",
+        },
+        status=drf_status.HTTP_404_NOT_FOUND,
     )
 
 
@@ -2480,26 +2541,58 @@ class ProxmoxFirewallRuleViewSet(_FirewallPushActionMixin, NetBoxModelViewSet):
     filterset_class = filtersets.ProxmoxFirewallRuleFilterSet
 
     @extend_schema(responses={200: OpenApiTypes.OBJECT})
-    @action(detail=False, methods=["post"], url_path="push")
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="push",
+        permission_classes=[
+            IsAuthenticated,
+            TokenWriteScopePermission,
+            EndpointOperationalActionPermission,
+        ],
+    )
     def bulk_push(self, request: Request) -> Response:
         """Push selected firewall rules to Proxmox."""
-        if not request.user.has_perm(permission_run_proxmox_action()):
-            return Response(
-                {
-                    "status": "error",
-                    "reason": "permission_denied",
-                    "detail": "Missing core.run_proxmox_action permission.",
-                },
-                status=drf_status.HTTP_403_FORBIDDEN,
-            )
         ids = request.data.get("ids") or request.data.get("pk") or []
         if not isinstance(ids, list):
             ids = [ids]
         actor = _actor_from_request(request)
         results = []
-        for rule in self.get_queryset().filter(pk__in=ids):
+        rules = list(self.get_queryset().filter(pk__in=ids))
+        requested_ids = {str(rule_id) for rule_id in ids}
+        if {str(rule.pk) for rule in rules} != requested_ids:
+            return Response(
+                {
+                    "status": "error",
+                    "reason": "permission_denied",
+                    "detail": "One or more firewall rules are outside the permitted scope.",
+                },
+                status=drf_status.HTTP_404_NOT_FOUND,
+            )
+        if any(
+            _firewall_endpoint_permission_error(request, rule) is not None
+            for rule in rules
+        ):
+            return Response(
+                {
+                    "status": "error",
+                    "reason": "permission_denied",
+                    "detail": (
+                        "At least one Proxmox endpoint is outside the operational "
+                        "permission scope."
+                    ),
+                },
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        for rule in rules:
             try:
-                results.append(push_firewall_object(rule, actor=actor).to_response())
+                results.append(
+                    push_firewall_object(
+                        rule,
+                        actor=actor,
+                        user=request.user,
+                    ).to_response()
+                )
             except FirewallPushError as exc:
                 results.append(
                     {

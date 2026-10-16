@@ -130,6 +130,43 @@ def _stub_create_view_imports(monkeypatch):
         sys.modules, "netbox_proxbox.services.individual_sync", individual_sync_mod
     )
 
+    endpoint_enabled_mod = types.ModuleType("netbox_proxbox.services.endpoint_enabled")
+    endpoint_enabled_mod.endpoint_is_enabled = lambda endpoint: bool(
+        getattr(endpoint, "enabled", True)
+    )
+    monkeypatch.setitem(
+        sys.modules, "netbox_proxbox.services.endpoint_enabled", endpoint_enabled_mod
+    )
+
+    operational_target_mod = types.ModuleType(
+        "netbox_proxbox.services.operational_target"
+    )
+
+    class OperationalTargetError(Exception):
+        def __init__(self, reason, detail, status_code):
+            self.reason = reason
+            self.detail = detail
+            self.status_code = status_code
+
+    operational_target_mod.OperationalTargetError = OperationalTargetError
+    operational_target_mod.resolve_operational_target = lambda **kwargs: (
+        SimpleNamespace(
+            endpoint=kwargs["endpoint"],
+            backend_endpoint_id=701,
+            context=SimpleNamespace(
+                http_url="https://backend.example.test",
+                headers={},
+                verify_ssl=True,
+                endpoint_id=1,
+            ),
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "netbox_proxbox.services.operational_target",
+        operational_target_mod,
+    )
+
     branch_lifecycle_mod = types.ModuleType("netbox_proxbox.services.branch_lifecycle")
     branch_lifecycle_mod.ActiveBranchRequiredError = type(
         "ActiveBranchRequiredError", (RuntimeError,), {}
@@ -151,6 +188,8 @@ def _stub_create_view_imports(monkeypatch):
     services_pkg._endpoint_errors = endpoint_errors_mod
     services_pkg.backend_context = backend_context_mod
     services_pkg.individual_sync = individual_sync_mod
+    services_pkg.endpoint_enabled = endpoint_enabled_mod
+    services_pkg.operational_target = operational_target_mod
     services_pkg.branch_lifecycle = branch_lifecycle_mod
     monkeypatch.setitem(sys.modules, "netbox_proxbox.services", services_pkg)
 
@@ -188,7 +227,8 @@ def test_create_view_class_exists_and_uses_expected_mixins(view_ast):
         for b in cls.bases
     }
     assert "TokenConditionalLoginRequiredMixin" in base_names
-    assert "ContentTypePermissionRequiredMixin" in base_names
+    assert "TokenWriteScopeRequiredMixin" in base_names
+    assert "EndpointOperationalPermissionRequiredMixin" in base_names
     assert "View" in base_names
 
 
@@ -199,8 +239,9 @@ def test_create_view_is_registered_post_only_and_permission_gated(view_src, view
     )
     cls = _find_class(view_ast, "ProxmoxEndpointCreateInstanceView")
     methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
-    assert {"get_required_permission", "post"} <= methods
-    assert "permission_run_proxmox_action()" in view_src
+    assert "post" in methods
+    assert 'ProxmoxEndpoint.objects.restrict(request.user, "view")' in view_src
+    assert "user_can_run_endpoint_action(request.user, endpoint.pk)" in view_src
     http_methods = _find_assign(cls, "http_method_names")
     assert isinstance(http_methods, ast.List)
     assert [e.value for e in http_methods.elts] == ["post"]
@@ -238,8 +279,7 @@ def test_templates_tab_context_exposes_write_gate_and_create_url():
 
 
 def test_create_view_uses_direct_proxbox_api_boundary(view_src):
-    assert "get_fastapi_request_context" in view_src
-    assert "resolve_backend_endpoint_id" in view_src
+    assert "resolve_operational_target" in view_src
     assert "/cloud/vm/provision" in view_src
     assert "/cloud/lxc/provision" in view_src
     assert "external control plane" not in view_src.lower()
@@ -247,7 +287,7 @@ def test_create_view_uses_direct_proxbox_api_boundary(view_src):
 
 def test_create_view_enforces_write_gate_before_backend_resolution(view_src):
     precheck_index = view_src.index("endpoint_allows_instance_create(endpoint)")
-    backend_index = view_src.index("get_fastapi_request_context()")
+    backend_index = view_src.index("resolve_operational_target(")
     assert precheck_index < backend_index
     assert "writes_disabled_for_endpoint" in view_src
 
@@ -287,8 +327,8 @@ def test_allow_writes_precheck_behavior(monkeypatch):
     monkeypatch.setattr(module, "get_object_or_404", lambda *a, **kw: endpoint)
     monkeypatch.setattr(
         module,
-        "get_fastapi_request_context",
-        lambda *a, **kw: calls.append("backend"),
+        "resolve_operational_target",
+        lambda **_kwargs: calls.append("backend"),
     )
 
     request = SimpleNamespace(
@@ -299,6 +339,28 @@ def test_allow_writes_precheck_behavior(monkeypatch):
 
     assert response.status_code == 403
     assert response.payload["reason"] == "writes_disabled_for_endpoint"
+    assert calls == []
+
+
+def test_disabled_endpoint_precheck_blocks_backend_resolution(monkeypatch):
+    module = _load_create_view(monkeypatch)
+    calls: list[str] = []
+    endpoint = SimpleNamespace(pk=1, enabled=False, allow_writes=True)
+    monkeypatch.setattr(module, "get_object_or_404", lambda *a, **kw: endpoint)
+    monkeypatch.setattr(
+        module,
+        "resolve_operational_target",
+        lambda **_kwargs: calls.append("backend"),
+    )
+
+    request = SimpleNamespace(
+        user=SimpleNamespace(username="ops"),
+        body=b'{"kind":"qemu","source":100,"name":"vm-1","target_node":"pve-a"}',
+    )
+    response = module.ProxmoxEndpointCreateInstanceView().post(request, pk=1)
+
+    assert response.status_code == 403
+    assert response.payload["reason"] == "endpoint_disabled"
     assert calls == []
 
 

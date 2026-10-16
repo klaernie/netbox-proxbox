@@ -23,6 +23,7 @@ class NodeMaterialContext:
     policy: Any
     content_type: Any
     nodes: dict[int, Any]
+    endpoints: dict[int, Any]
     original_node_device_ids: dict[int, int | None] = field(default_factory=dict)
     device_ids: set[int] = field(default_factory=set)
     allow_new: bool = False
@@ -77,6 +78,23 @@ class NodeMaterialContext:
             if (node := self.nodes.get(node_id)) is not None
         )
         return {device_id for device_id in device_ids if device_id is not None}
+
+    def validate_openbao_storage(self, credential: Any) -> None:
+        """Revalidate the locked endpoint and settings before provider writes."""
+        from .openbao import validate_locked_openbao_storage
+
+        node = self.nodes.get(credential.node_id)
+        endpoint = self.endpoints.get(node.endpoint_id) if node is not None else None
+        if endpoint is None:
+            raise ValidationError("The declared Proxmox endpoint no longer exists.")
+        validate_locked_openbao_storage(
+            self.settings,
+            endpoint_override=endpoint.credential_storage_backend,
+            conflict_message=(
+                "The node credential storage selection changed after material "
+                "was supplied."
+            ),
+        )
 
     def assignment_selected_elsewhere(
         self,
@@ -225,6 +243,21 @@ def _lock_devices(nodes: dict[int, Any], additional_ids: set[int]) -> set[int]:
     return locked_ids
 
 
+def _lock_endpoints(nodes: dict[int, Any]) -> dict[int, Any]:
+    from netbox_proxbox.models import ProxmoxEndpoint
+
+    endpoint_ids = {node.endpoint_id for node in nodes.values()}
+    endpoints = {
+        endpoint.pk: endpoint
+        for endpoint in ProxmoxEndpoint.objects.select_for_update()
+        .filter(pk__in=endpoint_ids)
+        .order_by("pk")
+    }
+    if endpoints.keys() != endpoint_ids:
+        raise ValidationError("A declared Proxmox endpoint no longer exists.")
+    return endpoints
+
+
 def _reference_values(owners: Sequence[Any]) -> set[str]:
     return {
         str(value)
@@ -288,6 +321,7 @@ def _declare_context(
     owners = _locked_owners(credentials)
     related_owners = _locked_related_owners(owners)
     nodes = _locked_nodes(credentials, owners, related_owners, new_node_ids)
+    endpoints = _lock_endpoints(nodes)
     device_ids = _lock_devices(nodes, target_device_ids)
     policy = _default_policy()
     policy_identity = (policy.pk, policy.engine_id)
@@ -306,6 +340,7 @@ def _declare_context(
         policy=policy,
         content_type=ContentType.objects.get_for_model(Device),
         nodes=nodes,
+        endpoints=endpoints,
         original_node_device_ids={
             node_id: node.netbox_device_id for node_id, node in nodes.items()
         },

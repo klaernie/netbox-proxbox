@@ -1,10 +1,10 @@
 # Proxmox OCI Testing Appliance
 
 The `emersonfelipesp/netbox-proxbox:oci` image is a testing appliance for the
-Proxmox VE OCI-to-LXC workflow. It combines NetBox, the latest stable
-`netbox-proxbox` release from PyPI, `proxbox-api`, PostgreSQL, Redis, and a NetBox
-RQ worker in one image. Do not use this all-in-one layout as a production NetBox
-deployment.
+Proxmox VE OCI-to-LXC workflow. It combines NetBox, a stable
+`netbox-proxbox` release from PyPI, its validated `proxbox-api` backend,
+PostgreSQL, Redis, and a NetBox RQ worker in one image. Do not use this
+all-in-one layout as a production NetBox deployment.
 
 The image exposes NetBox on TCP port `8080`. proxbox-api listens separately on
 TCP port `8800`, but binds to `127.0.0.1` by default because the plugin consumes
@@ -114,15 +114,36 @@ is required; an unprivileged LXC cannot safely change that host-level setting.
 
 ## Image tags and updates
 
-`oci` tracks the latest successfully tested stable PyPI releases. For a
-GitHub Release, the image installs exactly the plugin version named by the
-release tag. The build waits for that version to appear on PyPI and fails if it
-does not, and it verifies the installed plugin version before publishing. For
-manual and pull-request runs, the image uses the newest stable PyPI release.
-After the versioned image is published, the `oci` tag moves only when the released plugin version is the newest stable
-published stable release (yanked or Python-incompatible newer releases still
-count), so rebuilding an older release never downgrades it. Prerelease tags are
-not published as images.
+`oci` tracks the latest successfully tested stable PyPI release. For a GitHub
+Release, the image installs exactly the plugin version named by the release tag
+and the `proxbox-api` version recorded for that plugin release in the table in
+the repository-root `COMPATIBILITY.md`. That table is the single declared source
+for release pairings. Release preparation must add exactly one row for the
+package version before creating its GitHub Release; a missing, duplicated, or
+malformed row stops resolution before any PyPI polling.
+
+The build waits until both PyPI's JSON metadata API and the JSON Simple
+Repository API used by installers list a compatible, non-yanked file for each
+exact version. `netbox-proxbox` and `proxbox-api` are pure-Python packages, so
+the release gate accepts only a source distribution or a pure-Python universal
+wheel whose Python tag covers the appliance runtime. It deliberately rejects a
+native-only distribution even when its `Requires-Python` value matches. The
+build fails when either PyPI source does not become ready within the shared
+publication deadline. Manual and pull-request runs retain newest-compatible
+stable selection, subject to the same two-index and artifact checks.
+
+The release workflow builds the final `linux/amd64` and `linux/arm64` OCI index
+once and initially uploads it by digest without a public tag. It pulls the
+amd64 manifest from that exact index for the installed-version and appliance
+smoke checks, including assertions for both `netbox-proxbox` and `proxbox-api`.
+Only after those checks pass does it assign the immutable versioned tag to the
+same index, and it compares the published digest with the built digest before
+tag promotion. The published image is therefore not a second build.
+
+After the versioned image is published, the `oci` tag moves only when the
+released plugin version is the newest published stable release (yanked or
+Python-incompatible newer releases still count), so rebuilding an older release
+never downgrades it. Prerelease tags are not published as images.
 Versioned tags encode all application versions plus the source commit:
 
 ```text

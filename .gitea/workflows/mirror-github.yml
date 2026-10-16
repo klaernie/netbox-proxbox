@@ -1,9 +1,15 @@
-name: Mirror selected branches to GitHub
+name: Mirror the release branch to GitHub
 
+# Only `main` is mirrored. `develop` is the Gitea-only integration branch: after
+# every squash promotion it is recreated from the new `main` tip, which is a
+# non-fast-forward rewrite. GitHub `develop` is protected (no force push, no
+# deletion, administrators enforced), so a fast-forward-only mirror of a
+# recreated branch always fails with "GitHub develop has diverged". GitHub
+# `develop` is therefore not authoritative and is not part of the release path;
+# the promotion workflow tags and releases from `main` only.
 on:
   push:
     branches:
-      - develop
       - main
 
 jobs:
@@ -71,7 +77,7 @@ jobs:
           source_repository="${GITHUB_REPOSITORY:?}"
 
           case "${mirror_branch}" in
-            develop|main)
+            main)
               ;;
             *)
               echo "::error::Ref ${mirror_branch} is not approved for GitHub mirroring."

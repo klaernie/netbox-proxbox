@@ -41,12 +41,21 @@ facts that an agent must have even when `@CLAUDE.md` expansion is unavailable:
   serializer, and derive OpenBao SSH readiness from one list-wide, actor-
   authorized credential metadata query without resolving credential material.
 - Keep historical migrations immutable and add a migration for schema changes.
+- Keep `automatic_background_tasks` strictly boolean and default-enabled.
+  Disabled startup discovery and system-monitor scheduling must preserve explicit
+  user jobs, integrity handlers, models, migrations, and audit records. Drain only
+  the stock unowned, unscoped one-minute monitor; restart all application and
+  worker processes for configuration changes.
 - Keep `ProxboxPluginSettings.sync_job_timeout` UI-backed and bounded to
   3600–604800 seconds. Resolve it when enqueueing a sync job, preserve explicit
   per-enqueue overrides, and never mutate the timeout of an already-running job.
 - Keep `Dockerfile.oci` testing-only, preserve its separate NetBox and
   proxbox-api Python runtimes, and keep its OCI entrypoint equivalent to the
-  Proxmox LXC `/sbin/init` path.
+  Proxmox LXC `/sbin/init` path. Release builds must use the single
+  plugin/backend pairing declared in `COMPATIBILITY.md` only after both required
+  PyPI APIs expose compatible, non-yanked source distributions or pure-Python
+  universal wheels, smoke-test the amd64 manifest from the final
+  multi-architecture index, and publish that same digest without rebuilding.
 - Convert exact Data Protection schedules through the source endpoint's
   discovered IANA timezone; keep unresolved timing visibly approximate and cap
   combined calendar node selection at 50.
@@ -59,6 +68,13 @@ facts that an agent must have even when `@CLAUDE.md` expansion is unavailable:
   NetBox's core `VirtualMachine` bulk-delete endpoint. Never route selected VM
   IDs to the parent cluster delete action; preserve the version-checked action
   adapter and its real-Django regression.
+- Keep per-VM HA reads endpoint-exact. The VM sync-state endpoint is
+  authoritative; linked typed cluster and node rows must agree with it. The tab
+  intersects that exact enabled endpoint with caller visibility. The REST route
+  requires `virtual_machine_id={netbox_vm_pk}`, restricts the VM by object
+  permission, verifies its synchronized VM ID matches the path `vmid`, and
+  queries only that one enabled, visible endpoint. Invalid, unresolved, or
+  hidden identity must fail before backend I/O.
 - Update MkDocs sources, this wrapper, `CLAUDE.md`, and generated `llms.txt`
   together when architecture or operator behavior changes.
 - Run focused tests, `mkdocs build --strict`, the public-boundary scanner, and
@@ -112,20 +128,20 @@ The complete semantic bridge contract is
 ## Supported versions
 
 The certified stable NetBox range is `4.5.8` through `4.7.99` (the whole 4.7 series is admitted by the numeric gate; CI verifies GA `4.7.0`). The current
-plugin version is `0.0.29.post4`.
+plugin version is `0.0.29.post5`.
 
-Current source pairing: netbox-proxbox 0.0.29.post4 <-> proxbox-api 0.0.23.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This describes the current sibling source revisions, not a historical published-release promise. The netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
+Current source pairing: netbox-proxbox 0.0.29.post5 <-> proxbox-api 0.0.27.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This describes the current sibling source revisions, not a historical published-release promise. The netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
 
-The last documented released runtime pairing for this release line remains
-netbox-proxbox 0.0.27 <-> proxbox-api 0.0.23.post2 <-> proxmox-sdk 0.0.15
+The documented released runtime pairing for this release line is
+netbox-proxbox 0.0.29.post5 <-> proxbox-api 0.0.27.post3 <-> proxmox-sdk 0.0.15
 <-> netbox-sdk 0.0.13. Do not rewrite historical release notes when the source
 pairing advances.
 
-Current backend-runtime pairing: netbox-proxbox 0.0.29.post4 <-> proxbox-api 0.0.23.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
+Current backend-runtime pairing: netbox-proxbox 0.0.29.post5 <-> proxbox-api 0.0.27.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
 
 ## Current implementation surfaces
 
-The current schema tip is migration `0105_reset_implicit_openbao_storage_default`.
+The current schema tip is migration `0106_device_sync_scope_and_netbox_token_approval`.
 Sensitive endpoint exports and runtime-key disclosure require an active,
 authenticated superuser or the default-off per-user sensitive-data flag.
 Only active superusers may administer grants. Keep object and provider checks
@@ -133,6 +149,17 @@ independent, resolve material with the request actor, and never cache grants.
 Proxmox node Device names use the effective endpoint/global
 `node_device_name_template`; keep the original short node name in Proxmox API
 paths and typed sync-state identity.
+Device sync-state identity also retains proxbox-api's independent
+`proxmox_endpoint_raw_id`; never substitute a local endpoint primary key.
+Stamped values are endpoint-exclusive, while null values remain unclaimed
+legacy candidates, never ownership proof. A consumer must corroborate actual
+cluster, site, and placement even for a singleton candidate before adoption.
+Device-sidecar claims lock the row; NULL-to-ID and same-ID writes are allowed,
+while changing a committed ID returns `endpoint_ownership_conflict`.
+Remote NetBox connection approval binds the effective token version and its
+non-secret v1 token reference or effective v2 key selected for transmission.
+Token changes require explicit
+reapproval, and token secrets never enter the fingerprint.
 The plugin provides endpoint and synchronized inventory models, typed sync
 state, guest interfaces, SDN/firewall/Firecracker inventory, service
 monitoring, metrics, browser consoles, intent/apply audit records, deletion
@@ -140,6 +167,19 @@ requests, and PBS/PDM companion endpoint records. `ProxboxSyncJob` owns staged
 SSE synchronization; `ProxmoxServiceMonitoringJob` is the one-minute system
 job. The `pxb` CLI provides configuration, backend and inventory inspection,
 headless synchronization, and deterministic CLI documentation capture.
+Proxmox operational actions use the grantable `run_proxmox_action` custom
+action on each `ProxmoxEndpoint`, with exact endpoint ObjectPermission scoping.
+The literal `core.run_proxmox_action` is a deprecated additive compatibility
+path. Unsafe requests authenticated by an API token require
+`write_enabled=True`; session authentication remains unchanged.
+Every operational dispatch binds the exact authorized, enabled NetBox endpoint
+to proxbox-api's separate endpoint ID through the shared operational-target
+resolver. Firewall previews carry a single translated endpoint scope and reject
+mismatched response identity. VM firewall ownership comes only from consistent
+typed sync state; explicit VM, node, and security-group relations must agree
+with their authoritative endpoint. Template builds retain the resolved backend
+context through dispatch. Disabled or conflicting endpoints produce no backend
+context or HTTP work.
 Optional PDM and RPC integrations require the companion plugin to be enabled in
 NetBox, not merely importable. A package that is installed but disabled must not
 render its tables or query its unmigrated settings model.
@@ -150,6 +190,23 @@ throttling retries share bounded delta-seconds and HTTP-date `Retry-After`
 parsing. Staged work uses one monotonic RQ-timeout deadline with a 120-second
 persistence reserve; deadline exhaustion records the current and remaining
 endpoint failures before finalization.
+
+The server-side WebSocket bridge binds positive `ws_run_id: 1` capability state
+to one authenticated connection, invalidates it on connection changes, and
+rechecks it when dispatching every correlated command. A rejection wins over
+an earlier in-flight probe. Capability doubt sends the legacy bare command. An
+attributable invalid-envelope response downgrades the same run, retries its
+command once as legacy, and tells its poller through a run-matched control
+record; foreign, malformed, and late rejections never replay a command. An
+expired or replaced pending envelope is retired without replay so its successor
+can dispatch. Reload and require the original endpoint trust identity after
+capability discovery and before any retry; trust loss closes the connection and
+surfaces a failed `sync-run` record without sending or downgrading the command.
+During mixed-version rolling deployment, one rejected envelope may be retried
+once as legacy and all later commands on that connection remain legacy.
+Correlated runs accept only exact, well-formed run identifiers and documented
+aggregate statuses. Legacy runs accept only untagged frames; full updates retain
+virtual-machine-terminal completion and the 600-second idle latch.
 
 OpenBao endpoint writes select the exact configured policy slug and use
 netbox-openbao's provider-owned transaction for UUID references, assignments,
@@ -175,6 +232,27 @@ and OpenBao-to-legacy changes must refuse while owned references or assignments
 remain and require explicit cleanup. Readiness and generic assignment selectors
 may be exposed as secret-free metadata, but live node material remains confined
 to the authenticated hardware credential endpoint.
+Global storage changes through `save()`, queryset `update()`, and
+`bulk_update()` lock the settings singleton before final guard checks and keep
+it locked through persistence. Both default and base manager querysets are
+guarded; validated literal bulk updates use only a context-local permit for
+Django's internal expression update. Provider outer material transactions are
+entered in autocommit. Inside their provider-owned durable transaction, the
+settings singleton is the first row lock, before every owner, assignment, or
+credential row; downstream row order remains transaction-specific.
+Every material writer must then revalidate its effective backend from the
+locked settings and owner graph before provider or assignment writes. Settings
+querysets must resolve the write-router alias before locking, bind every final
+state read to that alias, and reject conflict upserts that update
+`credential_storage_backend`. A blank endpoint override inherits the effective
+global selection from the locked settings row on that same write database.
+Supported endpoint deletion removes assignments before `pre_delete`; any
+assignment-only state remaining at that signal proves an unsupported delete and
+must be refused. An explicitly legacy endpoint with assignment-only state uses
+plain ORM cleanup in the current application transaction and never enters a
+provider material transaction. It must freshly resolve the request actor and
+authorize every exact assignment deletion before deleting any row; referenced
+OpenBao endpoints retain their provider-owned cleanup path.
 Verified Fernet rotation and selective reset may cross the single-secret
 queryset guard only through the private exact model, database alias, field, and
 ciphertext permit. Ordinary or mismatched writes and reference mutations remain

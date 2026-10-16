@@ -19,8 +19,79 @@ from netbox_proxbox.api.serializers.endpoints import (
     ProxmoxEndpointSerializer,
 )
 from netbox_proxbox.api.views import NetBoxEndpointViewSet, ProxmoxEndpointViewSet
-from netbox_proxbox.services.connection_authority import ConnectionAuthorityError
+from netbox_proxbox.models import NetBoxEndpoint, ProxmoxEndpoint
+from netbox_proxbox.services.connection_authority import (
+    ConnectionAuthorityError,
+    connection_target_data,
+    connection_target_fingerprint,
+)
 from netbox_proxbox.views import backend_sync
+
+
+def test_native_netbox_v1_token_reference_is_bound_to_fingerprint() -> None:
+    first_token = Token(pk=31, version=1, plaintext="a" * 40)
+    second_token = Token(pk=32, version=1, plaintext="b" * 40)
+    endpoint = NetBoxEndpoint(
+        domain="netbox.example.test",
+        port=443,
+        token=first_token,
+        token_version="v1",
+    )
+    approved = connection_target_fingerprint(endpoint)
+    assert connection_target_fingerprint(endpoint) == approved
+    assert connection_target_data(endpoint)["token_identity"] == "31"
+
+    endpoint.token = second_token
+    assert connection_target_fingerprint(endpoint) != approved
+
+
+def test_native_netbox_v2_key_is_bound_but_secret_is_excluded() -> None:
+    endpoint = NetBoxEndpoint(
+        domain="netbox.example.test",
+        port=443,
+        token_version="v2",
+        token_key="nbt_identity-key",
+        token_secret="first-secret",
+    )
+    approved = connection_target_fingerprint(endpoint)
+    endpoint.token_secret = "rotated-secret"
+    assert connection_target_fingerprint(endpoint) == approved
+    assert connection_target_data(endpoint)["token_identity"] == "nbt_identity-key"
+
+    endpoint.token_key = "nbt_rotated-key"
+    assert connection_target_fingerprint(endpoint) != approved
+
+
+def test_native_netbox_linked_v2_key_fallback_is_bound_to_fingerprint() -> None:
+    first_token = Token(pk=41, version=2, key="linked-key-a")
+    second_token = Token(pk=42, version=2, key="linked-key-b")
+    endpoint = NetBoxEndpoint(
+        domain="netbox.example.test",
+        port=443,
+        token=first_token,
+        token_version="v2",
+        token_key="",
+        token_secret="linked-secret",
+    )
+    approved = connection_target_fingerprint(endpoint)
+    assert connection_target_data(endpoint)["token_identity"] == "linked-key-a"
+
+    endpoint.token = second_token
+    assert connection_target_fingerprint(endpoint) != approved
+
+
+def test_native_proxmox_fingerprint_formula_is_byte_identical() -> None:
+    endpoint = ProxmoxEndpoint(
+        domain="pve.example.test",
+        port=8006,
+        verify_ssl=True,
+        username="root@pam",
+        token_name="api",
+    )
+    assert connection_target_fingerprint(endpoint) == (
+        "d1698f8ccd0ef0ebd26e18fa503c40878861880777421f76ab4059a28dd2a770"
+    )
+    assert "token_identity" not in connection_target_data(endpoint)
 
 
 @pytest.mark.parametrize("kind", ["proxmox", "netbox"])

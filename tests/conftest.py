@@ -14,6 +14,7 @@ import pytest
 
 from tests.django_stubs import django_stub_modules
 from tests.choices_stubs import attach_credential_storage_backend_choices
+from tests.operational_security_support import endpoint_authorizer
 
 
 class HttpResponse:
@@ -240,6 +241,251 @@ def _stub_backend_auth_headers(obj):
     return {"Authorization": f"Bearer {token}"}
 
 
+def _default_fastapi_url(_obj):
+    return {
+        "http_url": "https://proxbox.local:8800",
+        "ip_address_url": "https://10.0.0.5:8800",
+        "verify_ssl": True,
+        "websocket_url": "wss://proxbox.local:8801/ws",
+    }
+
+
+def _stub_ip_address_host(value):
+    return str(value).split("/")[0] if value else "127.0.0.1"
+
+
+def _resolve_vm_type_stub(vm: object) -> str:
+    sync_state = getattr(vm, "proxbox_sync_state", None)
+    typed_type = str(getattr(sync_state, "proxmox_vm_type", "") or "").lower()
+    if typed_type in {"lxc", "qemu"}:
+        return typed_type
+    vm_type_obj = getattr(vm, "virtual_machine_type", None)
+    if vm_type_obj and hasattr(vm_type_obj, "slug"):
+        slug = str(vm_type_obj.slug)
+        if "lxc" in slug:
+            return "lxc"
+        if "qemu" in slug:
+            return "qemu"
+    return "qemu"
+
+
+def _build_model_stub_modules(
+    *,
+    fastapi_endpoint,
+    netbox_endpoint,
+    proxmox_endpoint,
+    proxbox_settings,
+):
+    models_module = types.ModuleType("netbox_proxbox.models")
+    endpoint_rows = (
+        ("FastAPIEndpoint", fastapi_endpoint),
+        ("NetBoxEndpoint", netbox_endpoint),
+        ("ProxmoxEndpoint", proxmox_endpoint),
+    )
+    for name, endpoint in endpoint_rows:
+        models_module.__dict__[name] = _make_model_class(
+            name,
+            first=endpoint,
+            objects_by_pk={1: endpoint} if endpoint is not None else {},
+        )
+
+    for name in (
+        "ProxmoxCluster",
+        "ProxmoxNode",
+        "ProxmoxStorage",
+        "ProxmoxStorageVirtualDisk",
+        "BackupRoutine",
+        "Replication",
+        "VMBackup",
+        "VMSnapshot",
+        "VMTaskHistory",
+    ):
+        models_module.__dict__[name] = _make_model_class(name)
+
+    settings = proxbox_settings
+    if settings is None:
+        settings = SimpleNamespace(
+            backend_log_file_path="/var/log/proxbox.log",
+            primary_ip_preference="ipv4",
+            encryption_key="",
+            save=lambda **kwargs: None,
+        )
+
+    class _ProxboxPluginSettings:
+        @classmethod
+        def get_solo(cls):
+            return settings
+
+    _ProxboxPluginSettings._meta = SimpleNamespace(
+        app_label="netbox_proxbox",
+        model_name="proxboxpluginsettings",
+    )
+    models_module.ProxboxPluginSettings = _ProxboxPluginSettings
+
+    virtualization_module = types.ModuleType("virtualization")
+    virtualization_models_module = types.ModuleType("virtualization.models")
+    virtualization_models_module.Cluster = _make_model_class("Cluster")
+    virtualization_models_module.VirtualMachine = _make_model_class("VirtualMachine")
+    virtualization_module.models = virtualization_models_module
+    return models_module, virtualization_module, virtualization_models_module
+
+
+def _build_utils_stub_module(get_fastapi_url):
+    utils_module = types.ModuleType("netbox_proxbox.utils")
+    utils_module.get_fastapi_url = get_fastapi_url or _default_fastapi_url
+    utils_module.get_backend_auth_headers = _stub_backend_auth_headers
+    utils_module.get_ip_address_host = _stub_ip_address_host
+    utils_module.resolve_vm_type = _resolve_vm_type_stub
+    return utils_module
+
+
+def _stub_http_timeout_for_sync_path(path):
+    if "virtualization/virtual-machines" in path or "full-update" in path:
+        return (5, 3600)
+    return 5
+
+
+class _StubNoReverseMatch(Exception):
+    pass
+
+
+class _StubQ:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __or__(self, other):
+        return self
+
+
+class _StubCount:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class _StubJobRunner:
+    pass
+
+
+class _StubAccessMixin:
+    def handle_no_permission(self):
+        return HttpResponse(status=403)
+
+
+class _StubLoginRequiredMixin:
+    pass
+
+
+class _StubConditionalLoginRequiredMixin:
+    def dispatch(self, request, *args, **kwargs):
+        return super().dispatch(request, *args, **kwargs)
+
+
+class _StubTokenConditionalLoginRequiredMixin:
+    def dispatch(self, request, *args, **kwargs):
+        return super().dispatch(request, *args, **kwargs)
+
+
+class _StubContentTypePermissionRequiredMixin:
+    additional_permissions = []
+
+    def get_required_permission(self):
+        return "stub.view_stub"
+
+    def has_permission(self):
+        return True
+
+    def dispatch(self, request, *args, **kwargs):
+        if not self.has_permission():
+            return HttpResponse(status=403)
+        return super().dispatch(request, *args, **kwargs)
+
+
+def _stub_register_model_view(*args, **kwargs):
+    def decorator(view_cls):
+        return view_cls
+
+    return decorator
+
+
+def _stub_get_viewname(model, action=None, rest_api=False):
+    meta = getattr(model, "_meta", None)
+    app_label = getattr(meta, "app_label", "netbox_proxbox")
+    model_name = getattr(meta, "model_name", "stub")
+    viewname = f"{app_label}:{model_name}"
+    if app_label == "netbox_proxbox":
+        viewname = f"plugins:{viewname}"
+    if action:
+        viewname = f"{viewname}_{action}"
+    return viewname
+
+
+class _StubQueue:
+    def fetch_job(self, jid):
+        return None
+
+
+class _StubInvalidJobOperation(Exception):
+    pass
+
+
+class _StubJob:
+    pass
+
+
+class _StubJobStatus:
+    QUEUED = "queued"
+    DEFERRED = "deferred"
+    SCHEDULED = "scheduled"
+    STARTED = "started"
+
+
+class _StubTable:
+    def __init__(self, queryset=None, *args, **kwargs):
+        self.queryset = queryset
+
+    def configure(self, request):
+        pass
+
+
+class _StubChoiceSet:
+    pass
+
+
+class _StubSyncTypeChoices(_StubChoiceSet):
+    BACKUP_ROUTINES = "backup-routines"
+    REPLICATIONS = "replications"
+    TASK_HISTORY = "task-history"
+    VIRTUAL_MACHINES = "virtual-machines"
+    STORAGE = "storage"
+    VIRTUAL_MACHINES_DISKS = "vm-disks"
+    VIRTUAL_MACHINES_BACKUPS = "vm-backups"
+    VIRTUAL_MACHINES_SNAPSHOTS = "vm-snapshots"
+    DEVICES = "devices"
+    NETWORK_INTERFACES = "network-interfaces"
+    VM_INTERFACES = "vm-interfaces"
+    IP_ADDRESSES = "ip-addresses"
+    SDN = "sdn"
+    ALL = "all"
+
+
+class _StubProxmoxModeChoices(_StubChoiceSet):
+    PROXMOX_MODE_UNDEFINED = "undefined"
+    PROXMOX_MODE_STANDALONE = "standalone"
+    PROXMOX_MODE_CLUSTER = "cluster"
+
+
+class _StubProxboxSyncJob:
+    @classmethod
+    def enqueue(cls, **kwargs):
+        raise RuntimeError("ProxboxSyncJob.enqueue must be patched in tests")
+
+
+class _StubScheduleSyncForm:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
 def load_plugin_module(
     module_name: str,
     *,
@@ -282,10 +528,7 @@ def load_plugin_module(
     django_urls = types.ModuleType("django.urls")
     django_urls.reverse = lambda *args, **kwargs: "/dummy/"
 
-    class NoReverseMatch(Exception):
-        pass
-
-    django_urls.NoReverseMatch = NoReverseMatch
+    django_urls.NoReverseMatch = _StubNoReverseMatch
 
     django_contrib = types.ModuleType("django.contrib")
     django_messages = MessagesStub()
@@ -321,20 +564,8 @@ def load_plugin_module(
 
     django_db_models = types.ModuleType("django.db.models")
 
-    class Q:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __or__(self, other):
-            return self
-
-    django_db_models.Q = Q
-
-    class Count:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    django_db_models.Count = Count
+    django_db_models.Q = _StubQ
+    django_db_models.Count = _StubCount
 
     # `django.db` itself, not just `django.db.models`.  Registering only the
     # submodule is enough for `from django.db.models import Q` (the full dotted
@@ -356,25 +587,15 @@ def load_plugin_module(
 
     netbox_jobs = types.ModuleType("netbox.jobs")
 
-    class JobRunner:
-        pass
-
-    netbox_jobs.JobRunner = JobRunner
+    netbox_jobs.JobRunner = _StubJobRunner
 
     django_auth = types.ModuleType("django.contrib.auth")
     django_auth_decorators = types.ModuleType("django.contrib.auth.decorators")
     django_auth_decorators.login_required = lambda func: func
     django_auth_mixins = types.ModuleType("django.contrib.auth.mixins")
 
-    class AccessMixin:
-        def handle_no_permission(self):
-            return HttpResponse(status=403)
-
-    class LoginRequiredMixin:
-        pass
-
-    django_auth_mixins.AccessMixin = AccessMixin
-    django_auth_mixins.LoginRequiredMixin = LoginRequiredMixin
+    django_auth_mixins.AccessMixin = _StubAccessMixin
+    django_auth_mixins.LoginRequiredMixin = _StubLoginRequiredMixin
     django_contrib.auth = django_auth
 
     utilities_permissions = types.ModuleType("utilities.permissions")
@@ -385,82 +606,30 @@ def load_plugin_module(
 
     utilities_views = types.ModuleType("utilities.views")
 
-    class ConditionalLoginRequiredMixin:
-        def dispatch(self, request, *args, **kwargs):
-            return super().dispatch(request, *args, **kwargs)
-
-    class TokenConditionalLoginRequiredMixin:
-        def dispatch(self, request, *args, **kwargs):
-            return super().dispatch(request, *args, **kwargs)
-
-    class ContentTypePermissionRequiredMixin:
-        additional_permissions = []
-
-        def get_required_permission(self):
-            return "stub.view_stub"
-
-        def has_permission(self):
-            return True
-
-        def dispatch(self, request, *args, **kwargs):
-            if not self.has_permission():
-                return HttpResponse(status=403)
-            return super().dispatch(request, *args, **kwargs)
-
-    def register_model_view(*args, **kwargs):
-        def decorator(view_cls):
-            return view_cls
-
-        return decorator
-
-    def get_viewname(model, action=None, rest_api=False):
-        # Mirrors NetBox semantics: plugin models reverse under
-        # ``plugins:<app_label>:``, core models under ``<app_label>:``.
-        meta = getattr(model, "_meta", None)
-        app_label = getattr(meta, "app_label", "netbox_proxbox")
-        model_name = getattr(meta, "model_name", "stub")
-        viewname = f"{app_label}:{model_name}"
-        if app_label == "netbox_proxbox":
-            viewname = f"plugins:{viewname}"
-        if action:
-            viewname = f"{viewname}_{action}"
-        return viewname
-
-    utilities_views.get_viewname = get_viewname
-    utilities_views.ConditionalLoginRequiredMixin = ConditionalLoginRequiredMixin
+    utilities_views.get_viewname = _stub_get_viewname
+    utilities_views.ConditionalLoginRequiredMixin = _StubConditionalLoginRequiredMixin
     utilities_views.TokenConditionalLoginRequiredMixin = (
-        TokenConditionalLoginRequiredMixin
+        _StubTokenConditionalLoginRequiredMixin
     )
     utilities_views.ContentTypePermissionRequiredMixin = (
-        ContentTypePermissionRequiredMixin
+        _StubContentTypePermissionRequiredMixin
     )
-    utilities_views.register_model_view = register_model_view
+    utilities_views.register_model_view = _stub_register_model_view
 
     netbox_module = types.ModuleType("netbox")
     netbox_plugins = types.ModuleType("netbox.plugins")
     netbox_plugins.PluginConfig = DummyPluginConfig
 
-    models_module = types.ModuleType("netbox_proxbox.models")
-    models_module.FastAPIEndpoint = _make_model_class(
-        "FastAPIEndpoint",
-        first=fastapi_endpoint,
-        objects_by_pk={1: fastapi_endpoint} if fastapi_endpoint is not None else {},
+    (
+        models_module,
+        virtualization_module,
+        virtualization_models_module,
+    ) = _build_model_stub_modules(
+        fastapi_endpoint=fastapi_endpoint,
+        netbox_endpoint=netbox_endpoint,
+        proxmox_endpoint=proxmox_endpoint,
+        proxbox_settings=proxbox_settings,
     )
-    models_module.NetBoxEndpoint = _make_model_class(
-        "NetBoxEndpoint",
-        first=netbox_endpoint,
-        objects_by_pk={1: netbox_endpoint} if netbox_endpoint is not None else {},
-    )
-    models_module.ProxmoxEndpoint = _make_model_class(
-        "ProxmoxEndpoint",
-        first=proxmox_endpoint,
-        objects_by_pk={1: proxmox_endpoint} if proxmox_endpoint is not None else {},
-    )
-    virtualization_module = types.ModuleType("virtualization")
-    virtualization_models_module = types.ModuleType("virtualization.models")
-    virtualization_models_module.Cluster = _make_model_class("Cluster")
-    virtualization_models_module.VirtualMachine = _make_model_class("VirtualMachine")
-    virtualization_module.models = virtualization_models_module
     core_module = types.ModuleType("core")
     core_choices = types.ModuleType("core.choices")
     core_choices.JobStatusChoices = SimpleNamespace(
@@ -480,77 +649,14 @@ def load_plugin_module(
     core_utils.stop_rq_job = lambda job_id: []
     core_module.choices = core_choices
     core_module.models = core_models
-    models_module.ProxmoxCluster = _make_model_class("ProxmoxCluster")
-    models_module.ProxmoxNode = _make_model_class("ProxmoxNode")
-    models_module.ProxmoxStorage = _make_model_class("ProxmoxStorage")
-    models_module.ProxmoxStorageVirtualDisk = _make_model_class(
-        "ProxmoxStorageVirtualDisk"
-    )
-    models_module.BackupRoutine = _make_model_class("BackupRoutine")
-    models_module.Replication = _make_model_class("Replication")
-    models_module.VMBackup = _make_model_class("VMBackup")
-    models_module.VMSnapshot = _make_model_class("VMSnapshot")
-    models_module.VMTaskHistory = _make_model_class("VMTaskHistory")
-
-    if proxbox_settings is None:
-        proxbox_settings = SimpleNamespace(
-            backend_log_file_path="/var/log/proxbox.log",
-            primary_ip_preference="ipv4",
-            encryption_key="",
-            save=lambda **kwargs: None,
-        )
-
-    class _ProxboxPluginSettings:
-        @classmethod
-        def get_solo(cls):
-            return proxbox_settings
-
-    _ProxboxPluginSettings._meta = SimpleNamespace(
-        app_label="netbox_proxbox",
-        model_name="proxboxpluginsettings",
-    )
-    models_module.ProxboxPluginSettings = _ProxboxPluginSettings
-
-    utils_module = types.ModuleType("netbox_proxbox.utils")
-    utils_module.get_fastapi_url = get_fastapi_url or (
-        lambda obj: {
-            "http_url": "https://proxbox.local:8800",
-            "ip_address_url": "https://10.0.0.5:8800",
-            "verify_ssl": True,
-            "websocket_url": "wss://proxbox.local:8801/ws",
-        }
-    )
-    utils_module.get_backend_auth_headers = _stub_backend_auth_headers
-    utils_module.get_ip_address_host = lambda value: (
-        str(value).split("/")[0] if value else "127.0.0.1"
-    )
-
-    def _resolve_vm_type_stub(vm: object) -> str:
-        sync_state = getattr(vm, "proxbox_sync_state", None)
-        typed_type = str(getattr(sync_state, "proxmox_vm_type", "") or "").lower()
-        if typed_type in {"lxc", "qemu"}:
-            return typed_type
-        vm_type_obj = getattr(vm, "virtual_machine_type", None)
-        if vm_type_obj and hasattr(vm_type_obj, "slug"):
-            slug = str(vm_type_obj.slug)
-            if "lxc" in slug:
-                return "lxc"
-            if "qemu" in slug:
-                return "qemu"
-        return "qemu"
-
-    utils_module.resolve_vm_type = _resolve_vm_type_stub
+    utils_module = _build_utils_stub_module(get_fastapi_url)
 
     backend_auth_module = types.ModuleType("netbox_proxbox.services.backend_auth")
     backend_auth_module.ensure_backend_key_registered = lambda *args, **kwargs: (
         True,
         "stubbed",
     )
-    backend_auth_module.http_timeout_for_sync_path = lambda path: (
-        (5, 3600)
-        if "virtualization/virtual-machines" in path or "full-update" in path
-        else 5
-    )
+    backend_auth_module.http_timeout_for_sync_path = _stub_http_timeout_for_sync_path
     backend_auth_module.wait_for_backend_ready = lambda *args, **kwargs: (
         True,
         "stubbed",
@@ -600,34 +706,18 @@ def load_plugin_module(
 
     django_rq_mod = types.ModuleType("django_rq")
 
-    class _QueueStub:
-        def fetch_job(self, jid):
-            return None
-
-    django_rq_mod.get_queue = lambda queue_name: _QueueStub()
+    django_rq_mod.get_queue = lambda queue_name: _StubQueue()
     stub_modules["django_rq"] = django_rq_mod
 
     rq_root = types.ModuleType("rq")
     rq_exceptions = types.ModuleType("rq.exceptions")
 
-    class InvalidJobOperation(Exception):
-        pass
-
-    rq_exceptions.InvalidJobOperation = InvalidJobOperation
+    rq_exceptions.InvalidJobOperation = _StubInvalidJobOperation
 
     rq_job_mod = types.ModuleType("rq.job")
 
-    class Job:
-        pass
-
-    class JobStatus:
-        QUEUED = "queued"
-        DEFERRED = "deferred"
-        SCHEDULED = "scheduled"
-        STARTED = "started"
-
-    rq_job_mod.Job = Job
-    rq_job_mod.JobStatus = JobStatus
+    rq_job_mod.Job = _StubJob
+    rq_job_mod.JobStatus = _StubJobStatus
 
     stub_modules["rq"] = rq_root
     stub_modules["rq.exceptions"] = rq_exceptions
@@ -635,17 +725,10 @@ def load_plugin_module(
 
     # Stub netbox_proxbox.tables so home_context.py can import table classes
     # without django_tables2 being installed in the test environment.
-    class _TableStub:
-        def __init__(self, queryset=None, *args, **kwargs):
-            self.queryset = queryset
-
-        def configure(self, request):
-            pass
-
     _tables_stub = types.ModuleType("netbox_proxbox.tables")
-    _tables_stub.ProxmoxEndpointTable = _TableStub
-    _tables_stub.NetBoxEndpointTable = _TableStub
-    _tables_stub.FastAPIEndpointTable = _TableStub
+    _tables_stub.ProxmoxEndpointTable = _StubTable
+    _tables_stub.NetBoxEndpointTable = _StubTable
+    _tables_stub.FastAPIEndpointTable = _StubTable
     stub_modules["netbox_proxbox.tables"] = _tables_stub
 
     for name, module in stub_modules.items():
@@ -657,9 +740,6 @@ def load_plugin_module(
     monkeypatch.setitem(sys.modules, "utilities", utilities_root)
     utilities_choices_mod = types.ModuleType("utilities.choices")
 
-    class _StubChoiceSet:
-        pass
-
     utilities_choices_mod.ChoiceSet = _StubChoiceSet
     monkeypatch.setitem(sys.modules, "utilities.choices", utilities_choices_mod)
 
@@ -670,29 +750,8 @@ def load_plugin_module(
 
     nbp_choices = types.ModuleType("netbox_proxbox.choices")
 
-    class _SyncTypeChoices(_StubChoiceSet):
-        BACKUP_ROUTINES = "backup-routines"
-        REPLICATIONS = "replications"
-        TASK_HISTORY = "task-history"
-        VIRTUAL_MACHINES = "virtual-machines"
-        STORAGE = "storage"
-        VIRTUAL_MACHINES_DISKS = "vm-disks"
-        VIRTUAL_MACHINES_BACKUPS = "vm-backups"
-        VIRTUAL_MACHINES_SNAPSHOTS = "vm-snapshots"
-        DEVICES = "devices"
-        NETWORK_INTERFACES = "network-interfaces"
-        VM_INTERFACES = "vm-interfaces"
-        IP_ADDRESSES = "ip-addresses"
-        SDN = "sdn"
-        ALL = "all"
-
-    class _ProxmoxModeChoices(_StubChoiceSet):
-        PROXMOX_MODE_UNDEFINED = "undefined"
-        PROXMOX_MODE_STANDALONE = "standalone"
-        PROXMOX_MODE_CLUSTER = "cluster"
-
-    nbp_choices.ProxmoxModeChoices = _ProxmoxModeChoices
-    nbp_choices.SyncTypeChoices = _SyncTypeChoices
+    nbp_choices.ProxmoxModeChoices = _StubProxmoxModeChoices
+    nbp_choices.SyncTypeChoices = _StubSyncTypeChoices
     attach_credential_storage_backend_choices(nbp_choices)
     nbp_choices.NetBoxTokenVersionChoices = SimpleNamespace(V1="v1", V2="v2")
     nbp_choices.ReplicationStatusChoices = SimpleNamespace(
@@ -703,12 +762,7 @@ def load_plugin_module(
 
     nbp_jobs = types.ModuleType("netbox_proxbox.jobs")
 
-    class _ProxboxSyncJob:
-        @classmethod
-        def enqueue(cls, **kwargs):
-            raise RuntimeError("ProxboxSyncJob.enqueue must be patched in tests")
-
-    nbp_jobs.ProxboxSyncJob = _ProxboxSyncJob
+    nbp_jobs.ProxboxSyncJob = _StubProxboxSyncJob
     nbp_jobs.PROXBOX_SYNC_QUEUE_NAME = "default"
     nbp_jobs.is_proxbox_sync_job = lambda job: True
     nbp_jobs.proxbox_sync_params_from_job = lambda job: {"sync_types": ["all"]}
@@ -720,12 +774,7 @@ def load_plugin_module(
 
     schedule_sync_stub = types.ModuleType("netbox_proxbox.forms.schedule_sync")
 
-    class ScheduleSyncForm:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-
-    schedule_sync_stub.ScheduleSyncForm = ScheduleSyncForm
+    schedule_sync_stub.ScheduleSyncForm = _StubScheduleSyncForm
     monkeypatch.setitem(
         sys.modules, "netbox_proxbox.forms.schedule_sync", schedule_sync_stub
     )
@@ -751,6 +800,13 @@ def load_plugin_module(
         "stub.reset_encrypted_secrets_proxboxpluginsettings"
     )
     proxbox_access.permission_run_proxmox_action = lambda: "core.run_proxmox_action"
+    proxbox_access.EndpointOperationalPermissionRequiredMixin = (
+        _StubContentTypePermissionRequiredMixin
+    )
+    proxbox_access.TokenWriteScopeRequiredMixin = type(
+        "TokenWriteScopeRequiredMixin", (), {}
+    )
+    proxbox_access.user_can_run_endpoint_action = endpoint_authorizer()
     proxbox_access.permission_view_fastapi_endpoint = lambda: (
         "stub.view_fastapiendpoint"
     )

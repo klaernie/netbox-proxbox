@@ -1,7 +1,7 @@
 """HTTP client helper that proxies Cloud Image Build Pipeline requests.
 
-The single ``FastAPIEndpoint`` row is the source of truth for the backend
-URL and API key. The plugin posts the request body verbatim to
+The caller supplies the backend context that was bound to the authorized
+Proxmox endpoint. The plugin posts the request body verbatim to
 ``POST /cloud/templates/images`` on proxbox-api and returns the upstream
 JSON / status pair to the caller on success.
 
@@ -18,7 +18,7 @@ from typing import Any
 
 import requests
 
-from netbox_proxbox.services.backend_proxy import get_fastapi_request_context
+from netbox_proxbox.schemas.backend_proxy import BackendRequestContext
 from netbox_proxbox.views.error_utils import (
     extract_backend_error_detail,
     parse_requests_response_json,
@@ -29,13 +29,14 @@ logger = logging.getLogger("netbox_proxbox.api.build_pve_template")
 
 def build_cloud_image_pipeline_via_backend(
     payload: dict[str, Any],
+    *,
+    context: BackendRequestContext,
 ) -> tuple[dict[str, Any], int]:
     """Proxy a Cloud Image Build Pipeline request to proxbox-api.
 
     Returns the body + HTTP status that should be sent back to the caller
     of the NetBox plugin endpoint. Always returns JSON-serialisable data.
     """
-    context = get_fastapi_request_context()
     http_url = getattr(context, "http_url", None)
     if not http_url:
         return (
@@ -95,7 +96,9 @@ def build_cloud_image_pipeline_via_backend(
 
 def build_pve_template_via_backend(
     payload: dict[str, Any],
+    *,
+    context: BackendRequestContext,
 ) -> tuple[dict[str, Any], int]:
     """Backward-compatible helper for the original PVE-only action."""
     payload = {**payload, "product_type": "pve"}
-    return build_cloud_image_pipeline_via_backend(payload)
+    return build_cloud_image_pipeline_via_backend(payload, context=context)

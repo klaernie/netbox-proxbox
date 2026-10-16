@@ -18,7 +18,10 @@ Proxbox stores synchronized compute inventory in NetBox's built-in `virtualizati
   the same NetBox IP used by the core VM interface assignment.
 - VMs whose `ProxboxVirtualMachineSyncState` has a resolvable
   `proxmox_vm_id` gain a read-only **HA** tab on the detail page, sibling to
-  **Proxmox Config**. The main detail page also shows a **Proxmox** card backed
+  **Proxmox Config**. Its live lookup is restricted to the VM's typed Proxmox
+  endpoint after applying the caller's endpoint object permissions; unresolved,
+  disabled, or hidden endpoint identity fails locally without a backend request.
+  The main detail page also shows a **Proxmox** card backed
   by typed sync state and cloud-init inventory; it omits the card when neither
   related row exists and shows only an SSH-key count, never key material. See
   [High Availability (HA)](../features/ha.md).

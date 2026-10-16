@@ -179,10 +179,169 @@ def load_real_backend_sync() -> types.ModuleType:
     return module
 
 
+def test_disabled_monitor_drains_existing_system_schedule(
+    monkeypatch, proxbox_sync_job_module
+):
+    module = proxbox_sync_job_module
+    monkeypatch.setattr(module, "automatic_background_tasks_enabled", lambda: False)
+    events = []
+    job = SimpleNamespace(
+        name="Proxmox Service Monitoring",
+        interval=1,
+        user_id=None,
+        object_id=None,
+        save=lambda **kwargs: events.append(("save", kwargs)),
+        start=lambda: events.append("start"),
+        terminate=lambda: events.append("terminate"),
+    )
+    monkeypatch.setattr(
+        module.ProxmoxServiceMonitoringJob,
+        "run",
+        lambda *_a, **_kw: pytest.fail("must not poll"),
+    )
+    module.ProxmoxServiceMonitoringJob.handle(job)
+    assert job.interval is None
+    assert job.data == {"proxbox_automatic_monitor_suppressed": True}
+    assert events == [
+        ("save", {"update_fields": ["interval", "data"]}),
+        "start",
+        "terminate",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["start", "terminate"])
+def test_disabled_monitor_retry_remains_suppressed_after_lifecycle_failure(
+    monkeypatch, proxbox_sync_job_module, failure
+):
+    module = proxbox_sync_job_module
+    monkeypatch.setattr(module, "automatic_background_tasks_enabled", lambda: False)
+    core = sys.modules["netbox.jobs"].JobRunner
+    monkeypatch.setattr(
+        core,
+        "handle",
+        classmethod(lambda *_a, **_kw: pytest.fail("must not poll or re-enqueue")),
+        raising=False,
+    )
+    stored = {}
+    failed = []
+
+    def lifecycle(name):
+        if name == failure and not failed:
+            failed.append(name)
+            raise RuntimeError("injected lifecycle failure")
+
+    job = SimpleNamespace(
+        name="Proxmox Service Monitoring",
+        interval=1,
+        user_id=None,
+        object_id=None,
+        object_type_id=None,
+        data={"existing": "metadata"},
+    )
+
+    def save(**kwargs):
+        assert kwargs == {"update_fields": ["interval", "data"]}
+        stored.update(interval=job.interval, data=dict(job.data))
+
+    job.save = save
+    job.start = lambda: lifecycle("start")
+    job.terminate = lambda: lifecycle("terminate")
+    with pytest.raises(RuntimeError, match="injected lifecycle failure"):
+        module.ProxmoxServiceMonitoringJob.handle(job)
+    assert stored == {
+        "interval": None,
+        "data": {"existing": "metadata", "proxbox_automatic_monitor_suppressed": True},
+    }
+    job.interval, job.data = stored["interval"], dict(stored["data"])
+    module.ProxmoxServiceMonitoringJob.handle(job)
+    assert job.interval is None
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [],
+        "invalid",
+        {"proxbox_automatic_monitor_suppressed": False},
+        {"proxbox_automatic_monitor_suppressed": 1},
+    ],
+)
+def test_disabled_monitor_rejects_malformed_metadata_before_core(
+    monkeypatch, proxbox_sync_job_module, data
+):
+    module = proxbox_sync_job_module
+    monkeypatch.setattr(module, "automatic_background_tasks_enabled", lambda: False)
+    core = sys.modules["netbox.jobs"].JobRunner
+    monkeypatch.setattr(
+        core,
+        "handle",
+        classmethod(lambda *_a, **_kw: pytest.fail("must fail closed")),
+        raising=False,
+    )
+    job = SimpleNamespace(
+        name="Proxmox Service Monitoring",
+        interval=None,
+        user_id=None,
+        object_id=None,
+        object_type_id=None,
+        data=data,
+    )
+    with pytest.raises(ValueError):
+        module.ProxmoxServiceMonitoringJob.handle(job)
+
+
+@pytest.mark.parametrize("enabled,user_id", [(True, None), (False, 8)])
+def test_enabled_and_user_monitor_preserve_core_handling(
+    monkeypatch, proxbox_sync_job_module, enabled, user_id
+):
+    module = proxbox_sync_job_module
+    monkeypatch.setattr(module, "automatic_background_tasks_enabled", lambda: enabled)
+    calls = []
+    core = sys.modules["netbox.jobs"].JobRunner
+    monkeypatch.setattr(
+        core,
+        "handle",
+        classmethod(lambda cls, job, *a, **kw: calls.append((job, a, kw))),
+        raising=False,
+    )
+    job = SimpleNamespace(
+        name="Proxmox Service Monitoring", interval=1, user_id=user_id, object_id=None
+    )
+    module.ProxmoxServiceMonitoringJob.handle(job, "arg", explicit=True)
+    assert calls == [(job, ("arg",), {"explicit": True})]
+    assert job.interval == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_monitor_registration_uses_option(
+    monkeypatch, proxbox_sync_job_module, enabled
+):
+    module = proxbox_sync_job_module
+    registered = []
+    monkeypatch.setattr(module, "automatic_background_tasks_enabled", lambda: enabled)
+
+    def register(*, interval):
+        def decorate(cls):
+            registered.append((cls, interval))
+            return cls
+
+        return decorate
+
+    monkeypatch.setattr(module, "system_job", register)
+    cls = module.ProxmoxServiceMonitoringJob
+    assert module._automatic_monitor_job(cls) is cls
+    assert registered == ([(cls, 1)] if enabled else [])
+
+
 @pytest.fixture
 def proxbox_sync_job_module(monkeypatch):
     """Load jobs.py with stubs for netbox.jobs and netbox_proxbox.choices."""
     monkeypatch.setitem(sys.modules, "django.db", django_stub_modules()["django.db"])
+    monkeypatch.setitem(
+        sys.modules,
+        "django.conf",
+        SimpleNamespace(settings=SimpleNamespace(PLUGINS_CONFIG={})),
+    )
 
     netbox_constants = types.ModuleType("netbox.constants")
     netbox_constants.RQ_QUEUE_DEFAULT = "default"

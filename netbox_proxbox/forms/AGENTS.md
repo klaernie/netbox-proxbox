@@ -143,7 +143,12 @@ Each endpoint type has an `ImportForm` (e.g. `ProxmoxEndpointImportForm`, `NetBo
   `ssh_credential_source` chooses either dedicated encrypted SSH credentials or
   reuse of the endpoint username/password. Reuse mode requires an endpoint
   password plus a pinned SSH host-key fingerprint and ignores the dedicated
-  SSH secret fields.
+  SSH secret fields. The main endpoint form passes its final write-only password
+  candidate to model validation through a transient attribute that is always
+  removed after `_post_clean()`; validation never stores credentials. The same
+  candidate satisfies service-monitoring validation during create or password
+  replacement, while operational readiness continues to require persisted
+  credential material.
 - `NodeSSHCredentialForm._post_clean()` encrypts submitted write-only secrets
   before model validation, then always delegates to
   `NetBoxModelForm._post_clean()`. That delegation is required even when no tags

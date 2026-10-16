@@ -65,6 +65,9 @@ def _endpoint(authority, kind="proxmoxendpoint") -> tuple[object, object, object
     endpoint.username = "root@pam"
     endpoint.token_name = "api"
     endpoint.token_version = "v2"
+    endpoint.token_id = None
+    endpoint.token_key = "backend-token-key"
+    endpoint.token_secret = "synthetic-secret"
     endpoint.approved_connection_target_fingerprint = (
         module.connection_target_fingerprint(endpoint)
     )
@@ -79,6 +82,97 @@ def _endpoint(authority, kind="proxmoxendpoint") -> tuple[object, object, object
     manager.get.return_value = persisted
     model.objects = manager
     return endpoint, persisted, manager
+
+
+def test_proxmox_fingerprint_formula_is_byte_identical(authority) -> None:
+    module, _ = authority
+    endpoint, _, _ = _endpoint(authority)
+    endpoint.token_version = ""
+    assert module.connection_target_fingerprint(endpoint) == (
+        "d1698f8ccd0ef0ebd26e18fa503c40878861880777421f76ab4059a28dd2a770"
+    )
+    assert "token_identity" not in module.connection_target_data(endpoint)
+
+
+def test_netbox_v1_token_reference_is_bound_to_approval(authority) -> None:
+    module, _ = authority
+    endpoint, persisted, _ = _endpoint(authority, "netboxendpoint")
+    endpoint.token_version = persisted.token_version = "v1"
+    endpoint.token_id = persisted.token_id = 31
+    approved = module.connection_target_fingerprint(endpoint)
+    endpoint.approved_connection_target_fingerprint = approved
+    persisted.approved_connection_target_fingerprint = approved
+    assert module.connection_target_fingerprint(endpoint) == approved
+    assert module.approved_connection_allows_secrets(endpoint)
+    endpoint.token_id = 32
+    assert not module.approved_connection_allows_secrets(endpoint)
+
+
+def test_netbox_v2_token_key_is_bound_but_secret_is_excluded(authority) -> None:
+    module, _ = authority
+    endpoint, persisted, _ = _endpoint(authority, "netboxendpoint")
+    approved = module.connection_target_fingerprint(endpoint)
+    endpoint.approved_connection_target_fingerprint = approved
+    persisted.approved_connection_target_fingerprint = approved
+    endpoint.token_secret = "rotated-secret"
+    assert module.connection_target_fingerprint(endpoint) == approved
+    assert module.approved_connection_allows_secrets(endpoint)
+    endpoint.token_key = "rotated-key"
+    assert not module.approved_connection_allows_secrets(endpoint)
+
+
+def test_linked_v2_token_change_denies_before_secret_resolution(
+    authority, monkeypatch
+) -> None:
+    module, _ = authority
+    endpoint, persisted, _ = _endpoint(authority, "netboxendpoint")
+    endpoint.token_key = persisted.token_key = ""
+    endpoint.token = persisted.token = SimpleNamespace(pk=41, key="linked-key-a")
+    endpoint.effective_token_version = persisted.effective_token_version = "v2"
+    approved = module.connection_target_fingerprint(endpoint)
+    endpoint.approved_connection_target_fingerprint = approved
+    persisted.approved_connection_target_fingerprint = approved
+    assert module.connection_target_data(endpoint)["token_identity"] == "linked-key-a"
+    assert module.approved_connection_allows_secrets(endpoint)
+
+    endpoint.token = SimpleNamespace(pk=42, key="linked-key-b")
+    secret_resolver = Mock(
+        side_effect=AssertionError("stale approval must deny before reading the secret")
+    )
+    type(endpoint).token_secret = property(lambda self: secret_resolver())
+    backend = _load_backend_sync_module(monkeypatch)
+    with pytest.raises(module.ConnectionAuthorityError, match="missing or stale"):
+        backend._netbox_endpoint_backend_payload(endpoint)
+    secret_resolver.assert_not_called()
+
+
+def test_v2_payload_and_fingerprint_share_effective_key_selection(
+    authority, monkeypatch
+) -> None:
+    module, _ = authority
+    endpoint, persisted, _ = _endpoint(authority, "netboxendpoint")
+    endpoint.name = persisted.name = "remote-netbox"
+    endpoint.token = persisted.token = SimpleNamespace(pk=41, key="linked-key")
+    endpoint.effective_token_version = persisted.effective_token_version = "v2"
+    backend = _load_backend_sync_module(monkeypatch)
+
+    endpoint.token_key = persisted.token_key = ""
+    approved = module.connection_target_fingerprint(endpoint)
+    endpoint.approved_connection_target_fingerprint = approved
+    persisted.approved_connection_target_fingerprint = approved
+    assert (
+        backend._netbox_endpoint_backend_payload(endpoint)["token_key"] == "linked-key"
+    )
+
+    endpoint.token_key = persisted.token_key = "explicit-key"
+    approved = module.connection_target_fingerprint(endpoint)
+    endpoint.approved_connection_target_fingerprint = approved
+    persisted.approved_connection_target_fingerprint = approved
+    assert module.connection_target_data(endpoint)["token_identity"] == "explicit-key"
+    assert (
+        backend._netbox_endpoint_backend_payload(endpoint)["token_key"]
+        == "explicit-key"
+    )
 
 
 def _actor(**overrides) -> SimpleNamespace:
@@ -277,7 +371,6 @@ def test_backend_payload_denies_before_secret_read_or_network(
         secret_resolver,
     )
     model = type(endpoint)
-    model.effective_token_version = property(lambda self: secret_resolver())
     model.effective_token_value = property(lambda self: secret_resolver())
     builder = (
         backend._proxmox_backend_payload
@@ -373,14 +466,18 @@ def test_approval_revoked_during_backend_listing_blocks_secret_push(
     }
     endpoint.effective_token_version = "v2"
     endpoint.token_secret = "synthetic-secret"
-    endpoint.token_key = "key"
+    endpoint.token_key = persisted.token_key = "key"
+    approved = module.connection_target_fingerprint(endpoint)
+    endpoint.approved_connection_target_fingerprint = approved
+    persisted.approved_connection_target_fingerprint = approved
     backend = _load_backend_sync_module(monkeypatch)
 
     def revoke(*args, **kwargs) -> None:
         persisted.approved_connection_target_fingerprint = ""
         return SimpleNamespace(status_code=200, raise_for_status=lambda: None)
 
-    monkeypatch.setattr(backend.requests, "get", revoke)
+    listing = Mock(side_effect=revoke)
+    monkeypatch.setattr(backend.requests, "get", listing)
     monkeypatch.setattr(
         backend, "parse_requests_response_json", lambda *args, **kwargs: ([], None)
     )
@@ -398,6 +495,7 @@ def test_approval_revoked_during_backend_listing_blocks_secret_push(
         "Connection target approval is missing or stale.",
         None,
     )
+    listing.assert_called_once()
     put.assert_not_called()
     post.assert_not_called()
 

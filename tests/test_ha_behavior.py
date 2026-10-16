@@ -52,6 +52,7 @@ def _install_drf_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
 
     rest_framework_status = types.ModuleType("rest_framework.status")
     rest_framework_status.HTTP_200_OK = 200
+    rest_framework_status.HTTP_400_BAD_REQUEST = 400
     rest_framework_status.HTTP_502_BAD_GATEWAY = 502
     rest_framework_status.HTTP_503_SERVICE_UNAVAILABLE = 503
 
@@ -66,8 +67,14 @@ def _install_drf_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
 
     drf_spectacular = types.ModuleType("drf_spectacular")
     drf_spectacular_types = types.ModuleType("drf_spectacular.types")
-    drf_spectacular_types.OpenApiTypes = SimpleNamespace(OBJECT="object")
+    drf_spectacular_types.OpenApiTypes = SimpleNamespace(OBJECT="object", INT="int")
     drf_spectacular_utils = types.ModuleType("drf_spectacular.utils")
+
+    class _OpenApiParameter:
+        QUERY = "query"
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
     def _extend_schema(*_a: object, **_kw: object):
         def _decorator(func):
@@ -76,6 +83,7 @@ def _install_drf_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
         return _decorator
 
     drf_spectacular_utils.extend_schema = _extend_schema
+    drf_spectacular_utils.OpenApiParameter = _OpenApiParameter
 
     monkeypatch.setitem(sys.modules, "rest_framework", rest_framework)
     monkeypatch.setitem(sys.modules, "rest_framework.status", rest_framework_status)
@@ -114,6 +122,25 @@ def _install_services_stubs(
 
     netbox_proxbox = types.ModuleType("netbox_proxbox")
     netbox_proxbox.__path__ = []  # mark as package
+    services_backend_path = types.ModuleType("netbox_proxbox.services.backend_path")
+    services_backend_path.UnsafeBackendPathSegment = ValueError
+    services_backend_path.safe_vmid = lambda value: str(value)
+    vm_identity = types.ModuleType("netbox_proxbox.vm_identity")
+    vm_identity.resolve_vm_endpoint_context = lambda _vm: (1, 100, "qemu")
+    vm_identity.resolve_vm_vmid = lambda vm: str(
+        getattr(getattr(vm, "proxbox_sync_state", None), "proxmox_vm_id", "") or ""
+    )
+    virtualization = types.ModuleType("virtualization")
+    virtualization_models = types.ModuleType("virtualization.models")
+
+    class _VirtualMachine:
+        DoesNotExist = type("DoesNotExist", (Exception,), {})
+        objects = SimpleNamespace(
+            all=lambda: None,
+            restrict=lambda *_args, **_kwargs: None,
+        )
+
+    virtualization_models.VirtualMachine = _VirtualMachine
 
     monkeypatch.setitem(sys.modules, "netbox_proxbox", netbox_proxbox)
     monkeypatch.setitem(sys.modules, "netbox_proxbox.services", services)
@@ -132,6 +159,14 @@ def _install_services_stubs(
         "netbox_proxbox.services.endpoint_scope",
         services_endpoint_scope,
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "netbox_proxbox.services.backend_path",
+        services_backend_path,
+    )
+    monkeypatch.setitem(sys.modules, "netbox_proxbox.vm_identity", vm_identity)
+    monkeypatch.setitem(sys.modules, "virtualization", virtualization)
+    monkeypatch.setitem(sys.modules, "virtualization.models", virtualization_models)
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -262,6 +297,7 @@ def test_vm_view_returns_503_when_backend_unconfigured(
         REPO_ROOT / "netbox_proxbox" / "api" / "ha.py",
     )
     view = module.HAVMResourceAPIView()
+    module._vm_endpoint_id = lambda _request, _vmid: 1
     resp = view.get(SimpleNamespace(user=None), 100)
     assert resp.status_code == 503
 
@@ -299,6 +335,7 @@ def test_vm_view_normalises_null_payload_to_empty_dict(
         REPO_ROOT / "netbox_proxbox" / "api" / "ha.py",
     )
     view = module.HAVMResourceAPIView()
+    module._vm_endpoint_id = lambda _request, _vmid: 1
     with patch("requests.get", return_value=_make_response(200, None)):
         resp = view.get(SimpleNamespace(user=None), 4242)
     assert resp.status_code == 200
@@ -314,6 +351,7 @@ def test_vm_view_uses_ten_second_timeout(monkeypatch: pytest.MonkeyPatch) -> Non
         REPO_ROOT / "netbox_proxbox" / "api" / "ha.py",
     )
     view = module.HAVMResourceAPIView()
+    module._vm_endpoint_id = lambda _request, _vmid: 1
     with patch("requests.get", return_value=_make_response(200, {})) as mock_get:
         view.get(SimpleNamespace(user=None), 4242)
     assert mock_get.call_args.kwargs["timeout"] == 10

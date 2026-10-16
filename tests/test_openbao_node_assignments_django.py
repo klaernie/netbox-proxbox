@@ -89,6 +89,7 @@ def _node(
     name: str = "OpenBao node",
     access_methods: str = "api",
     enabled: bool = False,
+    storage_backend: str = "openbao",
 ):
     from netbox_proxbox.models import ProxmoxEndpoint, ProxmoxNode
 
@@ -96,7 +97,7 @@ def _node(
         name=f"{name} endpoint",
         enabled=enabled,
         access_methods=access_methods,
-        credential_storage_backend="openbao",
+        credential_storage_backend=storage_backend,
     )
     return ProxmoxNode.objects.create(
         endpoint=endpoint,
@@ -937,6 +938,76 @@ def test_openbao_to_legacy_switch_refuses_remaining_node_state(
         type(endpoint).objects.bulk_update([endpoint], ["credential_storage_backend"])
 
 
+@pytest.mark.parametrize(
+    "operation", ["save", "update", "bulk_update", "base_update", "base_bulk_update"]
+)
+def test_clearing_endpoint_override_uses_explicit_global_legacy_selection(
+    openbao_node_estate,
+    operation: str,
+) -> None:
+    from django.core.exceptions import ValidationError
+    from netbox_proxbox.models import ProxboxPluginSettings
+    from netbox_proxbox.models.ssh_credential import AUTH_METHOD_PASSWORD
+
+    actor, _policy, _backend = openbao_node_estate
+    owner = _owner(
+        _node(name=f"clear-override-{operation}", storage_backend="openbao"),
+        actor,
+        AUTH_METHOD_PASSWORD,
+    )
+    owner.set_password("clear-override-password", key="unused", user=actor)
+    owner.save()
+    endpoint = owner.node.endpoint
+    settings = ProxboxPluginSettings.get_solo()
+    ProxboxPluginSettings.objects.filter(pk=settings.pk).update(
+        credential_storage_backend="legacy_encrypted"
+    )
+
+    with pytest.raises(ValidationError, match="cleanup path"):
+        if operation == "save":
+            endpoint.credential_storage_backend = ""
+            endpoint.save(update_fields=["credential_storage_backend"])
+        elif operation in {"update", "base_update"}:
+            manager = (
+                type(endpoint)._base_manager
+                if operation == "base_update"
+                else type(endpoint).objects
+            )
+            manager.filter(pk=endpoint.pk).update(credential_storage_backend="")
+        else:
+            endpoint.credential_storage_backend = ""
+            manager = (
+                type(endpoint)._base_manager
+                if operation == "base_bulk_update"
+                else type(endpoint).objects
+            )
+            manager.bulk_update([endpoint], ["credential_storage_backend"])
+
+    endpoint.refresh_from_db()
+    owner.refresh_from_db()
+    assert endpoint.credential_storage_backend == "openbao"
+    assert owner.openbao_password_credential_uuid is not None
+
+
+def test_node_base_manager_update_refuses_openbao_state(openbao_node_estate) -> None:
+    from django.core.exceptions import ValidationError
+    from netbox_proxbox.models import NodeSSHCredential
+    from netbox_proxbox.models.ssh_credential import AUTH_METHOD_PASSWORD
+
+    actor, _policy, _backend = openbao_node_estate
+    owner = _owner(_node(name="base-manager-node-owner"), actor, AUTH_METHOD_PASSWORD)
+    owner.set_password("base-manager-password", key="unused", user=actor)
+    owner.save()
+
+    with pytest.raises(ValidationError, match="cleanup path"):
+        NodeSSHCredential._base_manager.filter(pk=owner.pk).update(
+            username="must-not-persist"
+        )
+
+    owner.refresh_from_db()
+    assert owner.username != "must-not-persist"
+
+
 @pytest.mark.parametrize("operation", ["update", "bulk_update"])
 def test_raw_node_link_writes_refuse_openbao_state(
     openbao_node_estate,
@@ -994,6 +1065,53 @@ def test_global_openbao_downgrade_refuses_inherited_node_state(
         ProxboxPluginSettings.objects.filter(pk=settings.pk).update(
             credential_storage_backend="legacy_encrypted"
         )
+
+
+def test_node_writer_revalidates_locked_storage_before_material(
+    openbao_node_estate,
+    monkeypatch,
+) -> None:
+    from django.core.exceptions import ValidationError
+    from netbox_openbao.models import Credential, CredentialAssignment
+    from netbox_proxbox.integrations import openbao_node_writer
+    from netbox_proxbox.models import ProxboxPluginSettings
+    from netbox_proxbox.models.ssh_credential import AUTH_METHOD_PASSWORD
+
+    actor, _policy, backend = openbao_node_estate
+    owner = _owner(
+        _node(name="locked-storage-node", storage_backend=""),
+        actor,
+        AUTH_METHOD_PASSWORD,
+    )
+    owner.set_password("must-not-write", key="unused", user=actor)
+    settings = ProxboxPluginSettings.get_solo()
+    credential_count = Credential.objects.count()
+    original_transaction = openbao_node_writer.node_material_transaction
+
+    @contextmanager
+    def downgrade_then_enter(*args, **kwargs):
+        ProxboxPluginSettings.objects.filter(pk=settings.pk).update(
+            credential_storage_backend="legacy_encrypted"
+        )
+        with original_transaction(*args, **kwargs) as context:
+            yield context
+
+    monkeypatch.setattr(
+        openbao_node_writer,
+        "node_material_transaction",
+        downgrade_then_enter,
+    )
+
+    with pytest.raises(ValidationError, match="storage selection changed"):
+        owner.save()
+
+    settings.refresh_from_db()
+    assert settings.credential_storage_backend == "legacy_encrypted"
+    assert owner.pk is None
+    assert owner.openbao_password_credential_uuid is None
+    assert Credential.objects.count() == credential_count
+    assert CredentialAssignment.objects.count() == 0
+    assert backend.store == {}
 
 
 def test_provider_removal_error_requires_explicit_secret_safe_cleanup(

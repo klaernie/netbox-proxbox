@@ -333,7 +333,7 @@ def test_firewall_push_and_preview_ui_contracts():
     assert "firewall_push_assets.html" in extension_contents
     assert "api_push_url" in extension_contents
     assert "api_preview_url" in extension_contents
-    assert "user.has_perm(permission_run_proxmox_action())" in right_page_source
+    assert "user_can_run_endpoint_action(user, endpoint.pk)" in right_page_source
     assert "FirewallBulkPushAction" in view_contents
     assert 'name = "bulk_push"' in view_contents
     assert 'path="push-selected"' in view_contents
@@ -341,9 +341,7 @@ def test_firewall_push_and_preview_ui_contracts():
     assert "preview_firewall_object" in api_view_contents
     assert 'url_path="preview"' in api_view_contents
     assert 'url_path="push"' in api_view_contents
-    assert (
-        "request.user.has_perm(permission_run_proxmox_action())" in api_preview_source
-    )
+    assert "_firewall_endpoint_permission_error(request, obj)" in api_preview_source
     assert "data-firewall-push-form" in push_button
     assert "data-firewall-api-url" in push_button
     assert "firewall_push.js" not in push_button

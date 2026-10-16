@@ -211,6 +211,7 @@ def _reconcile_node_link(
     from .openbao_assignments import resolve_transaction_actor
     from .openbao_node_assignments import reconcile_node_assignment
 
+    context.validate_openbao_storage(owner)
     result = original(node, *args, **kwargs)
     context.nodes[node.pk].netbox_device_id = node.netbox_device_id
     actor = resolve_transaction_actor(
@@ -388,6 +389,7 @@ def _save_owned(
     )
 
     context.admit(owner)
+    context.validate_openbao_storage(owner)
     _validate_reference_mutations(context, owner, pending)
     _validate_partial_assignment_state(context, owner, pending, kwargs)
     actor = resolve_transaction_actor(

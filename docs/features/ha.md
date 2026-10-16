@@ -30,6 +30,17 @@ When the VM has a resolvable Proxmox VM ID it issues:
 GET /proxmox/cluster/ha/resources/by-vm/{vmid}
 ```
 
+Before that request, the plugin uses the VM sync-state endpoint as the
+authoritative Proxmox identity and verifies that any linked typed cluster and
+node belong to the same endpoint. It does not infer the endpoint from the
+NetBox cluster link, which may be shared by tracking rows from multiple Proxmox
+endpoints. The plugin then intersects the exact enabled endpoint with those
+visible to the caller, and the backend request contains only that endpoint ID.
+If the endpoint identity is unresolved, inconsistent, disabled, or outside the
+caller's object-permission scope, the tab renders a local warning and does not
+contact the backend. This prevents duplicate VM IDs on independent Proxmox
+clusters from returning another VM's HA state.
+
 The backend tries SID `vm:{vmid}` first and falls back to `ct:{vmid}`, returning `null` (not 404) when neither is HA-managed. The tab renders:
 
 - **HA managed** yes/no, group, current state, CRM state, request state, node.
@@ -102,7 +113,7 @@ The plugin's REST shim that exposes both backend calls as JSON for non-HTML cons
 - The VM HA tab uses NetBox's standard `virtualization.view_virtualmachine` permission and `restrict()` so users only see HA state for VMs they may view.
 - HA arm/disarm requires the `run_proxmox_action` action on Proxmox endpoints (see above). Model-level `change_proxmoxendpoint` alone no longer grants it.
 - The cluster page reuses the plugin's dashboard mixin chain (`ConditionalLoginRequiredMixin` + `RequireProxboxDashboardAccessMixin`), so it follows the same access rules as the rest of the Proxbox UI.
-- The HA status page, the VM HA tab, and the HA REST API only ask proxbox-api about enabled Proxmox endpoints the caller may view (`ProxmoxEndpoint.objects.restrict(user, "view")`). An anonymous caller with `LOGIN_REQUIRED = False` sees HA data only when the Proxmox endpoint view permission is exempt.
+- The HA status page asks proxbox-api about all enabled Proxmox endpoints the caller may view (`ProxmoxEndpoint.objects.restrict(user, "view")`). The VM HA tab and per-VM REST endpoint narrow that set again to the selected VM's single typed endpoint. The REST endpoint requires `virtual_machine_id={netbox_vm_pk}` and verifies that the synchronized Proxmox VM ID matches the path `{vmid}`. An anonymous caller with `LOGIN_REQUIRED = False` sees HA data only when the Proxmox endpoint view permission is exempt.
 
 ## Related Pages
 

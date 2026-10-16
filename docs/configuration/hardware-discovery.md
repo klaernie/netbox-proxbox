@@ -247,6 +247,11 @@ The endpoint API consumed by `proxbox-api`
 same response keys in both modes: host, username, port, auth method, host-key
 fingerprint, password/private-key presence flags, `password`, and `private_key`.
 
+A disabled Proxmox endpoint cannot create a browser SSH terminal session. The
+session endpoint returns HTTP 409 before resolving stored credentials, accepting
+one-shot or Store credentials, or contacting `proxbox-api`; this applies equally
+to endpoint and node terminal targets.
+
 !!! warning "Reuse mode exposes the Proxmox API password"
     In **Reuse endpoint username/password** mode the secrets endpoint returns the
     endpoint's own Proxmox API password (reused as the SSH password). That endpoint

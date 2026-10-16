@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from threading import Barrier, Event
 from typing import Any
 from uuid import uuid4
@@ -408,6 +409,47 @@ def test_legacy_preserves_external_reference_and_rejects_material(
         owner.set_password("must-not-store", user=actor)
 
 
+def test_cloudinit_writer_revalidates_locked_storage_before_material(
+    cloudinit_owner,
+    monkeypatch,
+) -> None:
+    from django.core.exceptions import ValidationError
+    from netbox_openbao.models import Credential, CredentialAssignment
+    from netbox_proxbox.integrations import openbao_cloudinit
+    from netbox_proxbox.models import ProxboxPluginSettings
+
+    owner, actor, _policy, backend = cloudinit_owner
+    owner.set_password("must-not-write", user=actor)
+    settings = ProxboxPluginSettings.get_solo()
+    credential_count = Credential.objects.count()
+    original_transaction = openbao_cloudinit.cloudinit_material_transaction
+
+    @contextmanager
+    def downgrade_then_enter(*args, **kwargs):
+        ProxboxPluginSettings.objects.filter(pk=settings.pk).update(
+            credential_storage_backend="legacy_encrypted"
+        )
+        with original_transaction(*args, **kwargs) as context:
+            yield context
+
+    monkeypatch.setattr(
+        openbao_cloudinit,
+        "cloudinit_material_transaction",
+        downgrade_then_enter,
+    )
+
+    with pytest.raises(ValidationError, match="legacy storage"):
+        owner.save()
+
+    settings.refresh_from_db()
+    assert settings.credential_storage_backend == "legacy_encrypted"
+    assert owner.pk is None
+    assert owner.openbao_password_credential_uuid is None
+    assert Credential.objects.count() == credential_count
+    assert CredentialAssignment.objects.count() == 0
+    assert backend.store == {}
+
+
 def test_delete_removes_only_owned_assignments_and_keeps_material(
     cloudinit_owner,
 ) -> None:
@@ -559,6 +601,25 @@ def test_additional_bulk_and_raw_guards(cloudinit_owner, operation: str) -> None
             ProxmoxVMCloudInit.objects.bulk_update([owner], ["ciuser"])
         else:
             ProxmoxVMCloudInit.objects.filter(pk=owner.pk)._raw_delete("default")
+
+
+def test_base_manager_cloudinit_update_refuses_openbao_state(
+    cloudinit_owner,
+) -> None:
+    from django.core.exceptions import ValidationError
+    from netbox_proxbox.models import ProxmoxVMCloudInit
+
+    owner, actor, _policy, _backend = cloudinit_owner
+    owner.set_password("base-manager-password", user=actor)
+    owner.save()
+
+    with pytest.raises(ValidationError, match="cleanup path"):
+        ProxmoxVMCloudInit._base_manager.filter(pk=owner.pk).update(
+            ciuser="must-not-persist"
+        )
+
+    owner.refresh_from_db()
+    assert owner.ciuser != "must-not-persist"
 
 
 def test_bulk_create_rejects_injected_openbao_reference(cloudinit_owner) -> None:

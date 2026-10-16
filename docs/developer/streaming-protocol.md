@@ -264,6 +264,72 @@ In addition to SSE, the plugin supports a **WebSocket channel** for broadcast me
 Browser ──── ws://netbox-host/plugins/proxbox/ws/ ──── websocket_client.py ──── proxbox-api WS
 ```
 
+The server-side bridge discovers the backend's short-lived metadata/health
+capabilities for each authenticated WebSocket connection. It invalidates
+positive capability state whenever that connection opens or closes and forces
+a fresh capability read when dispatching each correlated command. The bridge
+rechecks the connection generation after each unlocked probe, and an envelope
+rejection recorded while a probe is in flight overrides that probe's result.
+After discovery, and again before any rejection retry, the bridge reloads the
+endpoint and requires the exact enablement, credential, and target identity
+that opened the WebSocket. Trust loss closes the connection without sending or
+downgrading the command, releases its latch, and emits a secret-free failed
+`sync-run` record for the poller.
+When the current connection advertises `{"capabilities": {"ws_run_id": 1}}`,
+the bridge generates a 32-character run identifier and sends this JSON text
+frame:
+
+```json
+{"command": "Full Update", "run_id": "9e5cf5e2f03a47dbb68b9889719d88b8"}
+```
+
+Every response frame for that command must echo the exact `run_id`. The plugin
+and `polling.js` ignore missing or different identifiers for completion and
+button release. A correlated full update completes only on its aggregate
+terminal, including when a stage was skipped:
+
+```json
+{
+  "object": "full-update",
+  "end": true,
+  "run_id": "9e5cf5e2f03a47dbb68b9889719d88b8",
+  "status": "completed",
+  "stages": {"devices": "completed", "virtual-machines": "skipped"}
+}
+```
+
+An aggregate `status` of `failed` is rendered as an error. Capability discovery
+is fail-safe: an absent, malformed, expired, or unreachable capability response
+causes the bridge to send the legacy bare command string. Legacy responses have
+no run identifier or aggregate terminal, and a full update therefore retains
+the existing virtual-machine-terminal completion and idle-latch behavior.
+Legacy polling ignores every frame that contains a `run_id`, including a frame
+broadcast for another worker's correlated run.
+
+If a queued correlated command reaches a changed connection that no longer
+advertises support, the bridge converts that command to the legacy form before
+transmission and emits a run-matched `sync-run` control record so its browser
+poller also switches to legacy matching. If a backend advertises support but
+answers the envelope with an attributable invalid-command response, the bridge
+marks support negative for that connection, emits the same control record, and
+retries the command once as a bare string. Attribution requires either the
+exact matching run identifier or the old backend's exact untagged plain-text
+response before any matching run frame has arrived. Foreign, malformed, and
+late rejection frames never replay a command. The relay retires an unanswered
+pending envelope when its latch expires or a successor replaces it, without
+replaying the retired command, so the successor can dispatch on the existing
+connection. It never allows the expired run's later terminal to release that
+successor.
+
+Capability discovery uses an HTTP request and therefore can reach a different
+backend instance from the persistent WebSocket during a rolling deployment. A
+capable HTTP peer may cause one envelope attempt against an older WebSocket
+peer. The older peer's attributable plain-text invalid-command response marks
+that connection legacy and replays the command exactly once as a bare string;
+later commands on the same connection remain legacy. The rejected envelope is
+not treated as an executed sync. A backend greeting is not required by this
+compatibility behavior.
+
 The `websocket.js` script exposes:
 
 ```js

@@ -14,6 +14,12 @@ Endpoint tabs may display reflected state but must not perform hidden writes on
 GET. POST actions require focused permission, scope, disabled-state, and failure
 tests.
 
+The SSH terminal session endpoint returns HTTP 409 with
+``{"error": "Proxmox endpoint is disabled."}`` immediately after its restricted
+endpoint lookup when the owner is disabled. This gate applies to endpoint and
+node targets and to stored, one-shot, and Store credentials; it must run before
+credential persistence, provider resolution, or any proxbox-api request.
+
 Sensitive exports use the shared uncached user-flag gate before resolving
 material. The request actor owns both queryset restriction and provider reveal;
 supplied token values cannot replace that actor. Refuse inaccessible explicit

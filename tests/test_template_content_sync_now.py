@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.operational_security_support import endpoint_authorizer
+
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1] / "netbox_proxbox" / "template_content.py"
@@ -21,7 +23,7 @@ SYNC_STATE_CARD_TEMPLATE_PATH = (
     MODULE_PATH.parent / "templates" / "netbox_proxbox" / "inc" / "sync_state_card.html"
 )
 SYNC_PERMISSION = "core.add_job"
-OPERATION_PERMISSION = "core.run_proxmox_action"
+OPERATION_PERMISSION = "netbox_proxbox.run_proxmox_action_proxmoxendpoint"
 
 
 class _User:
@@ -225,7 +227,9 @@ def template_content_module(monkeypatch):
         "netbox_proxbox.views.proxbox_access": _module(
             "netbox_proxbox.views.proxbox_access",
             permission_enqueue_proxbox_sync=lambda: SYNC_PERMISSION,
-            permission_run_proxmox_action=lambda: OPERATION_PERMISSION,
+            user_can_run_endpoint_action=endpoint_authorizer(
+                permission=OPERATION_PERMISSION,
+            ),
         ),
     }
     for name, module in stub_modules.items():
@@ -419,6 +423,40 @@ def test_virtual_machine_reverses_its_core_registered_action(template_content_mo
     assert extension.buttons() == f"/route/{viewname}/61/"
     assert harness.calls["get_viewname"] == [(vm, "proxbox_sync_now", False)]
     assert harness.calls["reverse"] == [(viewname, {"pk": 61})]
+
+
+def test_virtual_machine_operational_buttons_use_endpoint_action(
+    template_content_module, monkeypatch
+):
+    harness = template_content_module
+    vm = harness.virtual_machine()
+    vm.pk = 63
+    vm.get_absolute_url = lambda: "/virtualization/virtual-machines/63/"
+    endpoint = SimpleNamespace(pk=7, allow_writes=True)
+    harness.classes["ProxmoxEndpoint"].objects = SimpleNamespace(
+        filter=lambda **kwargs: SimpleNamespace(first=lambda: endpoint)
+    )
+    monkeypatch.setattr(
+        harness.module,
+        "resolve_vm_endpoint_context",
+        lambda obj: (endpoint.pk, 100, "qemu"),
+    )
+
+    allowed = harness.module.ProxboxVirtualMachineTemplateExtension(
+        _context(vm, OPERATION_PERMISSION)
+    )
+    allowed.buttons()
+    denied = harness.module.ProxboxVirtualMachineTemplateExtension(_context(vm))
+    denied.buttons()
+
+    assert any(
+        template == "netbox_proxbox/inc/vm_operational_buttons.html"
+        for template, _context_data in allowed.render_calls
+    )
+    assert all(
+        template != "netbox_proxbox/inc/vm_operational_buttons.html"
+        for template, _context_data in denied.render_calls
+    )
 
 
 def test_virtual_machine_card_renders_typed_state_and_cloud_init(

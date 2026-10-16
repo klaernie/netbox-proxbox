@@ -25,6 +25,38 @@ Enable the plugin in `configuration/plugins.py`:
 PLUGINS = ["netbox_proxbox"]
 ```
 
+### Disable automatic background work
+
+Inventory-only deployments can retain all plugin models, migrations, and job
+APIs without startup discovery or the recurring Proxmox service monitor:
+
+```python
+PLUGINS_CONFIG = {
+    "netbox_proxbox": {"automatic_background_tasks": False},
+}
+```
+
+The option defaults to `True` and accepts only a Python boolean. Strings such as
+`"false"` and integers are invalid configuration, not alternate boolean syntax.
+Restart every NetBox application and RQ worker process after changing the option.
+Do not leave workers running with the previous configuration.
+
+With the option disabled, a previously persisted stock system monitor drains at
+its next execution: its recurrence is cleared, the audit record completes, and
+no discovery, service collection, or replacement timer is performed. No job
+records are deleted. Cleanup applies only to the exact unowned, unscoped
+one-minute `Proxmox Service Monitoring` schedule, with neither an object ID nor
+an object type. The non-secret `proxbox_automatic_monitor_suppressed=True` marker
+in existing job metadata is saved together with the cleared interval. A retry
+after lifecycle failure therefore remains suppressed. Existing metadata is
+retained; malformed metadata or suppression markers fail closed instead of
+falling through to polling. Unmarked nonrecurring jobs are not classified as
+suppressed timers. Explicit user jobs, custom
+names, object-scoped jobs, and other intervals retain normal job handling.
+This option does not cancel an operation already executing in an old process,
+disable explicit user-requested synchronization, or suppress event-driven
+inventory/credential integrity handlers.
+
 Rebuild and start:
 
 ```bash

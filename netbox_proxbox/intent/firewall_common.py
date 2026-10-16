@@ -28,13 +28,23 @@ from netbox_proxbox.models import (
     ProxmoxNode,
 )
 from netbox_proxbox.services._endpoint_errors import translate_request_exception
-from netbox_proxbox.services.backend_context import get_fastapi_request_context
+from netbox_proxbox.services.endpoint_enabled import endpoint_is_enabled
+from netbox_proxbox.services.endpoint_scope import enabled_backend_endpoint_scope
 from netbox_proxbox.services.http_client import (
     HttpClient,
     HttpError,
     get_default_http_client,
 )
-from netbox_proxbox.vm_identity import resolve_vm_node, resolve_vm_vmid
+from netbox_proxbox.services.operational_target import (
+    OperationalTarget,
+    OperationalTargetError,
+    resolve_operational_target,
+)
+from netbox_proxbox.vm_identity import (
+    resolve_vm_endpoint_context,
+    resolve_vm_node,
+    resolve_vm_vmid,
+)
 
 FIREWALL_PUSH_TIMEOUT_SECONDS = 30
 
@@ -201,57 +211,184 @@ def save_status_for_firewall_object(obj: object, status: str) -> None:
 
 
 def resolve_firewall_endpoint(obj: object) -> ProxmoxEndpoint | None:
-    """Resolve the ProxmoxEndpoint associated with a firewall object."""
-    endpoint = getattr(obj, "endpoint", None)
-    if endpoint is not None:
-        return endpoint
+    """Resolve an endpoint only when every firewall ownership link agrees."""
+    try:
+        return _require_consistent_firewall_endpoint(obj)
+    except FirewallPushError:
+        return None
 
+
+def _require_consistent_firewall_endpoint(obj: object) -> ProxmoxEndpoint:
+    """Bind firewall scope to one authoritative endpoint or fail closed."""
+    endpoint = _explicit_firewall_endpoint(obj)
+    if endpoint is None:
+        raise FirewallPushError(
+            "endpoint_required",
+            "This firewall object is not explicitly linked to a Proxmox endpoint.",
+            status_code=400,
+        )
+
+    scope = _firewall_scope_for_object(obj)
+    if scope in {FirewallZoneChoices.VM_QEMU, FirewallZoneChoices.VM_LXC}:
+        _validate_vm_endpoint_identity(obj, endpoint)
+    elif scope == FirewallZoneChoices.NODE:
+        _require_matching_endpoint(
+            endpoint,
+            getattr(getattr(obj, "proxmox_node", None), "endpoint", None),
+            "The firewall object's node belongs to a different Proxmox endpoint.",
+        )
+    elif scope == FirewallZoneChoices.SECURITY_GROUP:
+        _require_matching_endpoint(
+            endpoint,
+            getattr(getattr(obj, "security_group", None), "endpoint", None),
+            "The firewall object's security group belongs to a different Proxmox endpoint.",
+        )
+    return endpoint
+
+
+def _explicit_firewall_endpoint(obj: object) -> ProxmoxEndpoint | None:
+    """Return only the endpoint relation explicitly stored by the firewall row."""
     if isinstance(obj, ProxmoxFirewallIPSetEntry):
-        return resolve_firewall_endpoint(obj.ipset)
+        return getattr(obj.ipset, "endpoint", None)
+    return getattr(obj, "endpoint", None)
 
-    node = getattr(obj, "proxmox_node", None)
-    if node is not None and getattr(node, "endpoint", None) is not None:
-        return node.endpoint
 
-    security_group = getattr(obj, "security_group", None)
-    if (
-        security_group is not None
-        and getattr(security_group, "endpoint", None) is not None
-    ):
-        return security_group.endpoint
+def _validate_vm_endpoint_identity(obj: object, endpoint: ProxmoxEndpoint) -> None:
+    """Require VM sync-state ownership and the firewall relation to agree."""
+    vm = _virtual_machine_for_scope(obj)
+    context = resolve_vm_endpoint_context(vm) if vm is not None else None
+    if context is None:
+        state_endpoint = _vm_sync_state_endpoint(vm)
+        if state_endpoint is not None and not endpoint_is_enabled(state_endpoint):
+            raise FirewallPushError(
+                "endpoint_disabled",
+                "The VM's authoritative Proxmox endpoint is disabled.",
+                status_code=403,
+            )
+        raise FirewallPushError(
+            "vm_endpoint_identity_required",
+            "VM-scoped firewall operations require a complete, consistent Proxbox "
+            "sync-state endpoint identity.",
+            status_code=400,
+        )
+    authoritative_endpoint_id, _vmid, vm_type = context
+    if _object_pk(endpoint) != authoritative_endpoint_id:
+        raise FirewallPushError(
+            "endpoint_mismatch",
+            "The firewall object's endpoint does not own its virtual machine.",
+            status_code=403,
+        )
+    expected_type = "lxc" if _firewall_scope_for_object(obj) == "vm_lxc" else "qemu"
+    if vm_type != expected_type:
+        raise FirewallPushError(
+            "firewall_scope_mismatch",
+            "The firewall object's VM scope does not match its authoritative VM type.",
+            status_code=400,
+        )
 
-    vm = getattr(obj, "virtual_machine", None)
-    if vm is not None:
-        return _endpoint_from_vm(vm)
 
-    return None
+def _vm_sync_state_endpoint(vm: object | None) -> ProxmoxEndpoint | None:
+    """Read the typed endpoint only to provide a precise local refusal reason."""
+    if vm is None:
+        return None
+    try:
+        state = getattr(vm, "proxbox_sync_state", None)
+    except AttributeError:
+        return None
+    return getattr(state, "endpoint", None)
+
+
+def _require_matching_endpoint(
+    endpoint: ProxmoxEndpoint,
+    related_endpoint: ProxmoxEndpoint | None,
+    detail: str,
+) -> None:
+    """Require an explicit related object and exact endpoint agreement."""
+    if related_endpoint is None or _object_pk(endpoint) != _object_pk(related_endpoint):
+        raise FirewallPushError("endpoint_mismatch", detail, status_code=403)
 
 
 def push_firewall_object(
     obj: object,
     *,
     actor: str,
+    user: object | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     """Push one firewall object through proxbox-api."""
-    if isinstance(obj, ProxmoxFirewallSecurityGroup):
-        return push_security_group(obj, actor=actor, client=client)
-    if isinstance(obj, ProxmoxFirewallRule):
-        return push_rule(obj, actor=actor, client=client)
-    if isinstance(obj, ProxmoxFirewallIPSet):
-        return push_ipset(obj, actor=actor, client=client)
-    if isinstance(obj, ProxmoxFirewallIPSetEntry):
-        return push_ipset_entry(obj, actor=actor, client=client)
-    if isinstance(obj, ProxmoxFirewallAlias):
-        return push_alias(obj, actor=actor, client=client)
-    if isinstance(obj, ProxmoxFirewallOptions):
-        return push_options(obj, actor=actor, client=client)
-
-    raise FirewallPushError(
-        "unsupported_firewall_object",
-        f"{type(obj).__name__} cannot be pushed to Proxmox firewall endpoints.",
-        status_code=400,
+    supported = (
+        ProxmoxFirewallSecurityGroup,
+        ProxmoxFirewallRule,
+        ProxmoxFirewallIPSet,
+        ProxmoxFirewallIPSetEntry,
+        ProxmoxFirewallAlias,
+        ProxmoxFirewallOptions,
     )
+    if not isinstance(obj, supported):
+        raise FirewallPushError(
+            "unsupported_firewall_object",
+            f"{type(obj).__name__} cannot be pushed to Proxmox firewall endpoints.",
+            status_code=400,
+        )
+    if not (actor or "").strip():
+        raise FirewallPushError(
+            "actor_required",
+            "Firewall pushes require an authenticated actor.",
+            status_code=422,
+        )
+    target = _firewall_operational_target(obj, user=user)
+    if isinstance(obj, ProxmoxFirewallSecurityGroup):
+        return push_security_group(obj, actor=actor, target=target, client=client)
+    if isinstance(obj, ProxmoxFirewallRule):
+        return push_rule(obj, actor=actor, target=target, client=client)
+    if isinstance(obj, ProxmoxFirewallIPSet):
+        return push_ipset(obj, actor=actor, target=target, client=client)
+    if isinstance(obj, ProxmoxFirewallIPSetEntry):
+        return push_ipset_entry(obj, actor=actor, target=target, client=client)
+    if isinstance(obj, ProxmoxFirewallAlias):
+        return push_alias(obj, actor=actor, target=target, client=client)
+    if isinstance(obj, ProxmoxFirewallOptions):
+        return push_options(obj, actor=actor, target=target, client=client)
+
+    raise AssertionError("supported firewall object was not dispatched")
+
+
+def _firewall_operational_target(
+    obj: object,
+    *,
+    user: object | None = None,
+) -> OperationalTarget:
+    """Resolve the firewall owner to one enabled, authorized backend target."""
+    try:
+        endpoint = _require_consistent_firewall_endpoint(obj)
+    except FirewallPushError:
+        save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
+        raise
+    if not endpoint_is_enabled(endpoint):
+        save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
+        raise FirewallPushError(
+            "endpoint_disabled",
+            "The linked Proxmox endpoint is disabled.",
+            status_code=403,
+        )
+    if not getattr(endpoint, "allow_writes", False):
+        save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
+        raise FirewallPushError(
+            "writes_disabled_for_endpoint",
+            "Firewall writes are disabled on the linked Proxmox endpoint.",
+            status_code=403,
+            response={"endpoint_id": getattr(endpoint, "pk", None)},
+        )
+    try:
+        return resolve_operational_target(endpoint=endpoint, user=user)
+    except OperationalTargetError as exc:
+        save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
+        raise FirewallPushError(
+            exc.reason,
+            exc.detail,
+            status_code=exc.status_code,
+            response={"endpoint_id": getattr(endpoint, "pk", None)},
+        ) from exc
 
 
 def validate_vm_firewall_scope(
@@ -320,17 +457,27 @@ def validate_vnet_firewall_scope(
 def preview_firewall_object(
     obj: object,
     *,
+    user: object | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPreviewResult:
     """Fetch live Proxmox state and compare it with the NetBox object."""
     netbox_state = firewall_object_state(obj)
-    endpoint = resolve_firewall_endpoint(obj)
-    if endpoint is None:
+    try:
+        endpoint = _require_consistent_firewall_endpoint(obj)
+    except FirewallPushError as exc:
         return FirewallPreviewResult(
             status="error",
             netbox_state=netbox_state,
-            reason="endpoint_required",
-            detail="This firewall object is not linked to a Proxmox endpoint.",
+            reason=exc.reason,
+            detail=exc.detail,
+        )
+
+    if not endpoint_is_enabled(endpoint):
+        return FirewallPreviewResult(
+            status="error",
+            netbox_state=netbox_state,
+            reason="endpoint_disabled",
+            detail="The linked Proxmox endpoint is disabled.",
         )
 
     path, params = _preview_read_target(obj)
@@ -342,22 +489,45 @@ def preview_firewall_object(
             detail="Live preview is not available for this firewall object.",
         )
 
-    context = get_fastapi_request_context()
-    if context is None or not context.http_url:
+    try:
+        target = resolve_operational_target(endpoint=endpoint, user=user)
+    except OperationalTargetError as exc:
         return FirewallPreviewResult(
             status="error",
             netbox_state=netbox_state,
-            reason="fastapi_endpoint_required",
-            detail="No FastAPI backend endpoint is configured.",
+            reason=exc.reason,
+            detail=exc.detail,
         )
+
+    scope_params, backend_id_by_pk, scope_error = enabled_backend_endpoint_scope(
+        base_url=target.context.http_url,
+        auth_headers=target.context.headers or {},
+        backend_verify_ssl=bool(target.context.verify_ssl),
+        timeout=FIREWALL_PUSH_TIMEOUT_SECONDS,
+        endpoint_ids=[target.endpoint.pk],
+    )
+    if (
+        scope_error
+        or scope_params is None
+        or backend_id_by_pk.get(target.endpoint.pk) != target.backend_endpoint_id
+    ):
+        return FirewallPreviewResult(
+            status="error",
+            netbox_state=netbox_state,
+            reason="backend_endpoint_unresolved",
+            detail=scope_error
+            or "The authorized endpoint could not be bound to one backend identity.",
+        )
+
+    request_params = {**(params or {}), **scope_params}
 
     http_client = client or get_default_http_client()
     try:
         response = http_client.get(
-            f"{context.http_url.rstrip('/')}{path}",
-            params=params,
-            headers=dict(context.headers or {}),
-            verify=bool(context.verify_ssl),
+            f"{target.context.http_url.rstrip('/')}{path}",
+            params=request_params,
+            headers=dict(target.context.headers or {}),
+            verify=bool(target.context.verify_ssl),
             timeout=FIREWALL_PUSH_TIMEOUT_SECONDS,
         )
     except HttpError as exc:
@@ -377,7 +547,16 @@ def preview_firewall_object(
             detail=str(_payload_value(payload, "detail") or response.text),
         )
 
-    proxmox_state = _select_proxmox_state(obj, payload, endpoint)
+    proxmox_state = _select_proxmox_state(obj, payload, target.endpoint)
+    if proxmox_state is not None and not _state_matches_backend_target(
+        proxmox_state, target.backend_endpoint_id
+    ):
+        return FirewallPreviewResult(
+            status="error",
+            netbox_state=netbox_state,
+            reason="backend_endpoint_mismatch",
+            detail="The backend returned firewall state for a different endpoint.",
+        )
     differing_fields = _differing_fields(netbox_state, proxmox_state or {})
     return FirewallPreviewResult(
         status="ready" if proxmox_state is not None else "missing",
@@ -421,6 +600,7 @@ def push_security_group(
     group: ProxmoxFirewallSecurityGroup,
     *,
     actor: str,
+    target: OperationalTarget | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     payload = _drop_empty({"group": group.name, "comment": group.comment})
@@ -430,6 +610,7 @@ def push_security_group(
         path="/proxmox/firewall/datacenter/groups",
         payload=payload,
         actor=actor,
+        target=target,
         client=client,
     )
 
@@ -438,6 +619,7 @@ def push_rule(
     rule: ProxmoxFirewallRule,
     *,
     actor: str,
+    target: OperationalTarget | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     method, path = _rule_push_target(rule)
@@ -447,6 +629,7 @@ def push_rule(
         path=path,
         payload=_rule_payload(rule),
         actor=actor,
+        target=target,
         client=client,
     )
 
@@ -455,6 +638,7 @@ def push_ipset(
     ipset: ProxmoxFirewallIPSet,
     *,
     actor: str,
+    target: OperationalTarget | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     path, _params = _scoped_collection_path(ipset, "ipsets")
@@ -465,6 +649,7 @@ def push_ipset(
         path=path,
         payload=payload,
         actor=actor,
+        target=target,
         client=client,
     )
 
@@ -473,6 +658,7 @@ def push_ipset_entry(
     entry: ProxmoxFirewallIPSetEntry,
     *,
     actor: str,
+    target: OperationalTarget | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     path, _params = _ipset_entry_path(entry)
@@ -486,6 +672,7 @@ def push_ipset_entry(
         path=path if method == "post" else f"{path}/{_ipset_entry_segment(entry.cidr)}",
         payload=payload,
         actor=actor,
+        target=target,
         client=client,
     )
 
@@ -494,6 +681,7 @@ def push_alias(
     alias: ProxmoxFirewallAlias,
     *,
     actor: str,
+    target: OperationalTarget | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     collection, _params = _scoped_collection_path(alias, "aliases")
@@ -516,6 +704,7 @@ def push_alias(
         path=path,
         payload=payload,
         actor=actor,
+        target=target,
         client=client,
     )
 
@@ -524,6 +713,7 @@ def push_options(
     options: ProxmoxFirewallOptions,
     *,
     actor: str,
+    target: OperationalTarget | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     path = _options_path(options)
@@ -541,6 +731,7 @@ def push_options(
         path=path,
         payload=payload,
         actor=actor,
+        target=target,
         client=client,
     )
 
@@ -552,6 +743,7 @@ def _call_firewall_backend(
     path: str,
     payload: dict[str, Any] | None,
     actor: str,
+    target: OperationalTarget | None = None,
     client: HttpClient | None = None,
 ) -> FirewallPushResult:
     actor_value = (actor or "").strip()
@@ -562,14 +754,28 @@ def _call_firewall_backend(
             status_code=422,
         )
 
-    endpoint = resolve_firewall_endpoint(obj)
-    if endpoint is None:
+    try:
+        endpoint = _require_consistent_firewall_endpoint(obj)
+    except FirewallPushError:
+        save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
+        raise
+    if not endpoint_is_enabled(endpoint):
         save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
         raise FirewallPushError(
-            "endpoint_required",
-            "This firewall object is not linked to a Proxmox endpoint.",
-            status_code=400,
+            "endpoint_disabled",
+            "The linked Proxmox endpoint is disabled.",
+            status_code=403,
         )
+    if target is None:
+        target = _firewall_operational_target(obj)
+    elif target.endpoint.pk != getattr(endpoint, "pk", None):
+        save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
+        raise FirewallPushError(
+            "endpoint_mismatch",
+            "The authorized endpoint does not own this firewall object.",
+            status_code=403,
+        )
+    endpoint = target.endpoint
     if not getattr(endpoint, "allow_writes", False):
         save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
         raise FirewallPushError(
@@ -579,19 +785,12 @@ def _call_firewall_backend(
             response={"endpoint_id": getattr(endpoint, "pk", None)},
         )
 
-    context = get_fastapi_request_context()
-    if context is None or not context.http_url:
-        save_status_for_firewall_object(obj, FirewallSyncStatusChoices.ERROR)
-        raise FirewallPushError(
-            "fastapi_endpoint_required",
-            "No FastAPI backend endpoint is configured.",
-            status_code=400,
-        )
+    context = target.context
 
     headers = dict(context.headers or {})
     headers["X-Proxbox-Actor"] = actor_value
     headers.setdefault("Content-Type", "application/json")
-    endpoint_id = int(getattr(endpoint, "pk", getattr(endpoint, "id", 0)))
+    endpoint_id = target.backend_endpoint_id
     separator = "&" if "?" in path else "?"
     url = f"{context.http_url.rstrip('/')}{path}{separator}endpoint_id={endpoint_id}"
     http_client = client or get_default_http_client()
@@ -741,6 +940,17 @@ def _select_proxmox_state(
     if isinstance(obj, ProxmoxFirewallAlias):
         return _find_item(payload, name=obj.name, cluster_name=cluster_name)
     return None
+
+
+def _state_matches_backend_target(
+    state: dict[str, Any], backend_endpoint_id: int
+) -> bool:
+    """Reject response state carrying a different backend endpoint identity."""
+    identity_fields = ("backend_endpoint_id", "proxmox_endpoint_id", "endpoint_id")
+    for field_name in identity_fields:
+        if field_name in state:
+            return _coerce_int(state.get(field_name)) == backend_endpoint_id
+    return True
 
 
 def _find_item(
@@ -1041,18 +1251,6 @@ def _node_name(node: ProxmoxNode | None) -> str:
             status_code=400,
         )
     return name
-
-
-def _endpoint_from_vm(vm: object) -> ProxmoxEndpoint | None:
-    cluster = getattr(vm, "cluster", None)
-    if cluster is None:
-        return None
-    tracking = getattr(cluster, "proxmox_cluster_tracking", None)
-    if tracking is None:
-        return None
-    first = getattr(tracking, "first", None)
-    proxmox_cluster = first() if callable(first) else None
-    return getattr(proxmox_cluster, "endpoint", None)
 
 
 def _status_target(obj: object) -> object | None:

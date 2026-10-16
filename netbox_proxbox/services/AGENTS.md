@@ -18,7 +18,11 @@ This directory contains service-layer modules for backend HTTP proxy, keepalive 
   fingerprinting, explicit sensitive-user approval for Proxmox and remote
   NetBox targets, current persisted-state checks before credential resolution
   and transmission, and a row-locked save guard that prevents forged or
-  resurrected approvals. FastAPI target edits enter its sensitive-user and
+  resurrected approvals. Remote NetBox fingerprints include the effective
+  token version and non-secret v1 token reference or effective v2 token key,
+  but never the token secret. The v2 selector is shared with payload creation:
+  an explicit key wins, otherwise the linked v2 token key is used. FastAPI
+  target edits enter its sensitive-user and
   object-permission policy before the existing authenticated key-adoption flow;
   the adoption state machine remains unchanged.
 - [`data_protection_calendar.py`](./data_protection_calendar.py): pure calendar
@@ -226,6 +230,17 @@ identity**, not its NetBox primary key:
   backend endpoint rows cannot bind reads to the first matching session.
   `views/dashboard_data.py::build_local_node_rows` bounds its name fallback to
   `proxmox_cluster__endpoint=<this endpoint>`.
+
+`operational_target.py::resolve_operational_target()` is the write-side binding
+for operational verbs, tags, firewall actions, template builds, and
+create-instance. It selects the exact endpoint from the actor's
+`run_proxmox_action` scope (or the deprecated literal compatibility path),
+rejects disabled endpoints before backend context resolution, and translates
+that same row through `resolve_backend_endpoint_id()`. Callers must dispatch
+only with the returned backend ID and must never fall back to the NetBox pk.
+Firewall preview further intersects this binding with
+`enabled_backend_endpoint_scope(endpoint_ids=[target.endpoint.pk])`, verifies
+the two translations agree, and sends that scope on every live preview read.
 
 `schemas/proxmox_node.py::ProxmoxClusterStatusResponse` flattens the backend's
 nested `node_list` (one cluster object per session) into top-level node records,

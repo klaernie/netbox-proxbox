@@ -68,6 +68,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate  # noqa: E
 
 from netbox_proxbox.api import views as api_views  # noqa: E402
 from netbox_proxbox.intent.firewall_common import FirewallPushError  # noqa: E402
+from netbox_proxbox.models import ProxmoxEndpoint  # noqa: E402
 
 
 class FirewallPreviewRefusalTests(TestCase):
@@ -80,6 +81,7 @@ class FirewallPreviewRefusalTests(TestCase):
         )
         cls.superuser.is_superuser = True
         cls.superuser.save()
+        cls.endpoint = ProxmoxEndpoint.objects.create(name="firewall-preview")
 
     def _preview(self, viewset: type) -> object:
         request = APIRequestFactory().get("/preview/")
@@ -95,7 +97,7 @@ class FirewallPreviewRefusalTests(TestCase):
             patch.object(
                 api_views.ProxmoxFirewallRuleViewSet,
                 "get_object",
-                return_value=SimpleNamespace(pk=1),
+                return_value=SimpleNamespace(pk=1, endpoint=self.endpoint),
             ),
             patch.object(api_views, "preview_firewall_object", side_effect=refusal),
         ):
@@ -112,7 +114,7 @@ class FirewallPreviewRefusalTests(TestCase):
             patch.object(
                 api_views.ProxmoxFirewallOptionsViewSet,
                 "get_object",
-                return_value=SimpleNamespace(pk=1),
+                return_value=SimpleNamespace(pk=1, endpoint=self.endpoint),
             ),
             patch.object(api_views, "preview_firewall_object", side_effect=refusal),
         ):

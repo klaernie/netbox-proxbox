@@ -52,6 +52,17 @@ class SyncStateConflict(APIException):
     default_code = "sync_state_conflict"
 
 
+class EndpointOwnershipConflict(APIException):
+    """A device sidecar was already claimed by another backend endpoint."""
+
+    status_code = 409
+    default_detail = {
+        "proxmox_endpoint_raw_id": ["endpoint_ownership_conflict"],
+        "code": "endpoint_ownership_conflict",
+    }
+    default_code = "endpoint_ownership_conflict"
+
+
 class RestrictedNestedObjectMixin:
     """Resolve writable nested objects through the caller's view permissions."""
 
@@ -579,6 +590,87 @@ class ProxboxDeviceSyncStateSerializer(
         allow_null=True,
     )
 
+    @staticmethod
+    def _reject_endpoint_ownership_change(instance, validated_data: dict) -> None:
+        if "proxmox_endpoint_raw_id" not in validated_data:
+            return
+        stored_raw_id = instance.proxmox_endpoint_raw_id
+        requested_raw_id = validated_data["proxmox_endpoint_raw_id"]
+        if stored_raw_id is not None and requested_raw_id != stored_raw_id:
+            raise EndpointOwnershipConflict()
+
+    @staticmethod
+    def _prepare_locked_change_log(instance, locked_instance) -> None:
+        """Snapshot the locked state and retain NetBox's submitted audit message."""
+        snapshot = getattr(locked_instance, "snapshot", None)
+        if callable(snapshot):
+            snapshot()
+        if hasattr(instance, "_changelog_message"):
+            locked_instance._changelog_message = instance._changelog_message
+
+    def _validate_parent_uniqueness(
+        self,
+        attrs: dict,
+        current_parent=None,
+    ) -> None:
+        if self.instance is None:
+            device = attrs.get(self.parent_field_name)
+            if device is not None:
+                existing = self.Meta.model.objects.filter(device=device).first()
+                if existing is not None:
+                    self._reject_endpoint_ownership_change(existing, attrs)
+        super()._validate_parent_uniqueness(
+            attrs,
+            current_parent=current_parent,
+        )
+
+    def create(self, validated_data: dict):
+        device = validated_data["device"]
+        try:
+            with transaction.atomic():
+                existing = (
+                    self.Meta.model.objects.select_for_update()
+                    .filter(device=device)
+                    .first()
+                )
+                if existing is not None:
+                    self._reject_endpoint_ownership_change(existing, validated_data)
+                    raise SyncStateConflict(
+                        {"device": "This object already has a Proxbox sync-state row."}
+                    )
+                # Keep changelog_message in validated_data. ChangeLoggingMixin.__init__
+                # consumes it when NetBoxModelSerializer creates the model instance.
+                return NetBoxModelSerializer.create(self, validated_data)
+        except IntegrityError as exc:
+            with transaction.atomic():
+                existing = (
+                    self.Meta.model.objects.select_for_update()
+                    .filter(device=device)
+                    .first()
+                )
+                if existing is not None:
+                    self._reject_endpoint_ownership_change(existing, validated_data)
+            raise SyncStateConflict() from exc
+
+    def update(self, instance, validated_data: dict):
+        try:
+            with transaction.atomic():
+                locked_instance = self.Meta.model.objects.select_for_update().get(
+                    pk=instance.pk
+                )
+                self._reject_endpoint_ownership_change(
+                    locked_instance,
+                    validated_data,
+                )
+                self._prepare_locked_change_log(instance, locked_instance)
+                return NetBoxModelSerializer.update(
+                    self,
+                    locked_instance,
+                    validated_data,
+                )
+        except IntegrityError as exc:
+            raise SyncStateConflict() from exc
+
     class Meta:
         model = ProxboxDeviceSyncState
         fields = (
@@ -591,6 +683,7 @@ class ProxboxDeviceSyncStateSerializer(
             "proxmox_node_name",
             "proxmox_cluster",
             "proxmox_cluster_name",
+            "proxmox_endpoint_raw_id",
             *DEVICE_PROXMOX_FIELDS,
             *SYNC_TRAILER_FIELDS,
         )

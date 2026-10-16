@@ -169,6 +169,22 @@ notifySyncEnd(completePayload);
 
 The WebSocket URL is injected into the page template from `FastAPIEndpoint.websocket_url`. If no WebSocket endpoint is configured, `websocket.js` degrades gracefully and the dashboard falls back to polling-only mode.
 
+The server-side polling bridge returns both a process-local message cursor and,
+when supported by the backend, a run identifier from its CSRF-protected start
+request. `polling.js` carries both values: the cursor prevents replay of older
+buffer entries, while the run identifier prevents a stale or unrelated terminal
+from completing the current page's run. Correlated full updates wait for the
+`full-update` aggregate terminal and report its `failed` status through the
+error callback. Backends without the `ws_run_id` capability continue to use the
+legacy bare command and per-stage terminal behavior. Legacy polling excludes
+all frames that carry a run identifier. If dispatch-time capability validation
+or an invalid-envelope response downgrades a queued command, a run-matched
+control record switches that page to legacy matching without attributing other
+workers' correlated broadcasts to it. If endpoint trust changes before a
+command or compatibility retry is transmitted, the bridge closes the
+connection and publishes a failed `sync-run` record; the poller reports that
+record through the error callback instead of waiting for its idle timeout.
+
 ---
 
 ## Forms and Sync Actions

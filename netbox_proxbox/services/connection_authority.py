@@ -28,9 +28,38 @@ def _ip_value(endpoint: object) -> str:
     return str(getattr(value, "address", value) or "").split("/", 1)[0].strip().lower()
 
 
+def _effective_netbox_token_version(endpoint: object) -> str:
+    """Return the configured NetBox authentication version without material."""
+    value = getattr(
+        endpoint,
+        "effective_token_version",
+        getattr(endpoint, "token_version", ""),
+    )
+    return str(value or "").strip().lower()
+
+
+def effective_netbox_token_key(endpoint: object) -> str:
+    """Return the secret-free v2 key that the backend payload will transmit."""
+    explicit_key = str(getattr(endpoint, "token_key", "") or "").strip()
+    if explicit_key:
+        return explicit_key
+    token = getattr(endpoint, "token", None)
+    return str(getattr(token, "key", "") or "").strip()
+
+
+def _netbox_token_identity(endpoint: object, token_version: str) -> str:
+    """Return the non-secret token reference or key selected by the version."""
+    if token_version == "v2":
+        return effective_netbox_token_key(endpoint)
+    token_id = getattr(endpoint, "token_id", None)
+    if token_id is None:
+        token_id = getattr(getattr(endpoint, "token", None), "pk", None)
+    return str(token_id or "")
+
+
 def connection_target_data(endpoint: object) -> dict[str, object]:
     """Describe both the primary and fallback target, without reading material."""
-    return {
+    data = {
         "kind": _model_name(endpoint),
         "domain": str(getattr(endpoint, "domain", "") or "")
         .strip()
@@ -43,6 +72,11 @@ def connection_target_data(endpoint: object) -> dict[str, object]:
         "token_name": str(getattr(endpoint, "token_name", "") or "").strip(),
         "token_version": str(getattr(endpoint, "token_version", "") or ""),
     }
+    if data["kind"] == "netboxendpoint":
+        token_version = _effective_netbox_token_version(endpoint)
+        data["token_version"] = token_version
+        data["token_identity"] = _netbox_token_identity(endpoint, token_version)
+    return data
 
 
 def connection_target_fingerprint(endpoint: object) -> str:

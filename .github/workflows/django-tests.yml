@@ -463,6 +463,8 @@ jobs:
             tests/test_sync_state_contracts.py
             tests/test_proxmox_endpoint_allowed_tenants.py
             tests/test_proxmox_endpoint_api_only_ssh_optional.py
+            tests/test_proxmox_endpoint_ssh_credential_source.py
+            tests/test_endpoint_ssh_complexity_django.py
             tests/test_proxmox_export_view.py
             tests/test_changelog_secret_redaction_django.py
             tests/test_connection_authority_django.py
@@ -490,12 +492,16 @@ jobs:
             tests/test_soft_deleted_vm_purge_django.py
             tests/test_bulk_vm_delete_django.py
             tests/test_ha_actions_django.py
+            tests/test_ha_vm_endpoint_scope_django.py
+            tests/test_operational_permissions_django.py
             tests/test_firewall_preview_errors_django.py
             tests/test_vm_config_identifier_refusal_django.py
             tests/test_websocket_sync_route_django.py
             tests/test_secure_transport_defaults_django.py
             tests/test_settings_read_scope_django.py
             tests/test_device_sync_state_filters_django.py
+            tests/test_device_sync_state_ownership_django.py
+            tests/test_device_scope_and_netbox_approval_migration_django.py
             tests/test_netbox_endpoint_table_django.py
           )
           openbao_tests=(

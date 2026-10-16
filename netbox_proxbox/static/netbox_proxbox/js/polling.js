@@ -6,19 +6,21 @@ const NEXT_CURSOR_HEADER = "X-Proxbox-Next-Cursor";
 const CURSOR_RESET_HEADER = "X-Proxbox-Cursor-Reset";
 const CURSOR_GAP_HEADER = "X-Proxbox-Cursor-Gap";
 const CURSOR_PATTERN = /^[0-9a-f]{16}\.\d{1,18}$/;
+const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+const RUN_MODE_OBJECT = "sync-run";
 const POLL_INTERVAL_MS = 1000;
 // Stop after this many consecutive empty polls with no terminal message.
 const DEFAULT_MAX_IDLE_POLLS = 120;
 
-// Backend message ``object`` whose ``end: true`` completes each sync kind.
-// proxbox-api emits no aggregate full-update terminal: a full update runs the
-// device stage and then the VM stage, so only the VM-stage terminal proves it
-// finished. Silence after the device stage is never treated as success.
+// Backend message ``object`` whose ``end: true`` completes each legacy sync.
+// A run-correlated full update instead completes on its aggregate terminal.
 const TERMINAL_OBJECT = {
     "full-update": "virtual_machine",
     devices: "device",
     "virtual-machines": "virtual_machine",
 };
+
+const ACTIVE_RUN_IDS = new Map();
 
 const TABLES = {
     virtual_machine: {
@@ -69,6 +71,11 @@ export async function startSync(objectType) {
     if (!response.ok && response.status !== 409) {
         throw new Error(payload.error || `Sync request failed with status ${response.status}`);
     }
+    if (RUN_ID_PATTERN.test(payload.run_id || "")) {
+        ACTIVE_RUN_IDS.set(objectType, payload.run_id);
+    } else {
+        ACTIVE_RUN_IDS.delete(objectType);
+    }
     return payload;
 }
 
@@ -116,8 +123,82 @@ async function fetchPage(objectType, cursor) {
     return { data, cursor: CURSOR_PATTERN.test(headerCursor || "") ? headerCursor : cursor };
 }
 
-function isComplete(objectType, messages) {
-    return messages.some((message) => endsObject(message, TERMINAL_OBJECT[objectType]));
+function selectedRunId(objectType, callbacks) {
+    const candidate = callbacks.runId ?? callbacks.run_id ?? ACTIVE_RUN_IDS.get(objectType);
+    return RUN_ID_PATTERN.test(candidate || "") ? candidate : null;
+}
+
+function hasRunId(message) {
+    return message && Object.prototype.hasOwnProperty.call(message, "run_id");
+}
+
+function isProtocolMessageValid(message) {
+    if (!message || (hasRunId(message) && !RUN_ID_PATTERN.test(message.run_id || ""))) {
+        return false;
+    }
+    if (message.object === "full-update" && message.end === true) {
+        return message.status === "completed" || message.status === "failed";
+    }
+    return true;
+}
+
+function messagesForRun(messages, runId) {
+    if (!runId) {
+        return {
+            messages: messages.filter((message) => message && !hasRunId(message)),
+            runId: null,
+        };
+    }
+    const downgradeIndex = messages.findIndex((message) => (
+        message
+        && message.object === RUN_MODE_OBJECT
+        && message.run_id === runId
+        && message.correlated === false
+    ));
+    if (downgradeIndex < 0) {
+        return {
+            messages: messages.filter((message) => message && message.run_id === runId),
+            runId,
+        };
+    }
+    const correlated = messages
+        .slice(0, downgradeIndex)
+        .filter((message) => message && message.run_id === runId);
+    const legacy = messages.slice(downgradeIndex + 1).filter((message) => (
+        message && !hasRunId(message)
+    ));
+    return { messages: [...correlated, ...legacy], runId: null };
+}
+
+function completionMessage(objectType, messages, runId) {
+    const terminalObject = runId && objectType === "full-update"
+        ? "full-update"
+        : TERMINAL_OBJECT[objectType];
+    return messages.find((message) => {
+        if (!endsObject(message, terminalObject)) {
+            return false;
+        }
+        if (!runId || objectType !== "full-update") {
+            return true;
+        }
+        return message.status === "completed" || message.status === "failed";
+    });
+}
+
+function failedFullUpdateError(message) {
+    const failedStages = Object.entries(message.stages || {})
+        .filter(([, status]) => status === "failed")
+        .map(([stage]) => stage);
+    const suffix = failedStages.length ? `: ${failedStages.join(", ")}` : "";
+    return new Error(`Full update failed${suffix}.`);
+}
+
+function failedRunMessage(messages) {
+    return messages.find((message) => (
+        message.object === RUN_MODE_OBJECT
+        && message.end === true
+        && message.status === "failed"
+    ));
 }
 
 /**
@@ -125,13 +206,15 @@ function isComplete(objectType, messages) {
  *
  * GET never starts a sync and never removes messages for other users. Empty
  * polls are normal while the backend works; polling completes only on the
- * terminal message for ``objectType`` (for a full update, the VM-stage
- * terminal). A cursor reset or gap is reported as an error, and polling gives
- * up with a timeout after ``maxIdlePolls`` consecutive empty polls.
+ * terminal message for ``objectType``. A correlated run ignores every frame
+ * without its exact run id and waits for the aggregate full-update terminal.
+ * A cursor reset or gap is reported as an error, and polling gives up with a
+ * timeout after ``maxIdlePolls`` consecutive empty polls.
  */
 export async function poll(objectType, callbacks = {}) {
     const { onComplete = () => {}, onError = () => {}, cursor = null } = callbacks;
     const maxIdlePolls = callbacks.maxIdlePolls ?? DEFAULT_MAX_IDLE_POLLS;
+    let runId = selectedRunId(objectType, callbacks);
     let nextCursor = cursor;
     let idlePolls = 0;
 
@@ -145,10 +228,29 @@ export async function poll(objectType, callbacks = {}) {
             return;
         }
         nextCursor = page.cursor;
-        idlePolls = page.data.length === 0 ? idlePolls + 1 : 0;
-        const messages = page.data.map(parseMessage);
-        messages.forEach(renderMessage);
-        if (isComplete(objectType, messages)) {
+        const messages = page.data.map(parseMessage).filter(isProtocolMessageValid);
+        const selected = messagesForRun(messages, runId);
+        if (runId && !selected.runId) {
+            ACTIVE_RUN_IDS.delete(objectType);
+        }
+        runId = selected.runId;
+        const runMessages = selected.messages;
+        idlePolls = runMessages.length === 0 ? idlePolls + 1 : 0;
+        runMessages.forEach(renderMessage);
+        const runFailure = failedRunMessage(runMessages);
+        if (runFailure) {
+            ACTIVE_RUN_IDS.delete(objectType);
+            onError(new Error(runFailure.error || "The sync connection is no longer trusted."));
+            return;
+        }
+        const terminal = completionMessage(objectType, runMessages, runId);
+        if (terminal && runId && objectType === "full-update" && terminal.status === "failed") {
+            ACTIVE_RUN_IDS.delete(objectType);
+            onError(failedFullUpdateError(terminal));
+            return;
+        }
+        if (terminal) {
+            ACTIVE_RUN_IDS.delete(objectType);
             onComplete();
             return;
         }

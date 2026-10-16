@@ -9,6 +9,12 @@ import time
 import uuid
 from netbox.constants import RQ_QUEUE_DEFAULT
 from netbox.jobs import JobRunner
+from netbox_proxbox.background_tasks import (
+    SUPPRESSION_MARKER,
+    automatic_background_tasks_enabled,
+    is_automatic_monitor,
+    monitor_data,
+)
 
 try:
     from netbox.jobs import system_job
@@ -1333,12 +1339,31 @@ def _record_service_monitoring_tick_error(endpoint: object, error: str) -> None:
 # NetBox system-job intervals are in MINUTES (INTERVAL_MINUTELY=1). This is a
 # 1-minute base tick; each endpoint is then collected only once its own
 # service_monitoring_interval_minutes has elapsed (default 5).
-@system_job(interval=1)
+def _automatic_monitor_job(cls: type[JobRunner]) -> type[JobRunner]:
+    """Register the stock timer only when automatic work is explicitly enabled."""
+    if automatic_background_tasks_enabled():
+        return system_job(interval=1)(cls)
+    return cls
+
+
+@_automatic_monitor_job
 class ProxmoxServiceMonitoringJob(JobRunner):
     """Periodic (1-minute) tick for async Proxmox endpoint service monitoring."""
 
     class Meta:
         name = "Proxmox Service Monitoring"
+
+    @classmethod
+    def handle(cls, job: Job, *args: object, **kwargs: object) -> None:
+        """Drain an existing automatic timer without deleting jobs or polling."""
+        if not automatic_background_tasks_enabled() and is_automatic_monitor(job):
+            job.interval = None
+            job.data = monitor_data(job) | {SUPPRESSION_MARKER: True}
+            job.save(update_fields=["interval", "data"])
+            job.start()
+            job.terminate()
+            return
+        super().handle(job, *args, **kwargs)
 
     def run(self, **kwargs: object) -> None:
         """Project finished collections and enqueue due service-monitoring RPCs."""

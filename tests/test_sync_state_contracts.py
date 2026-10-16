@@ -88,6 +88,10 @@ def test_sync_state_api_wiring() -> None:
     assert "pk__in=candidate_ids" in serializers
     assert "node.netbox_device_id != parent.pk" in serializers
     assert "cluster.netbox_cluster_id != parent.pk" in serializers
+    device_serializer = serializers.split("class ProxboxDeviceSyncStateSerializer", 1)[
+        1
+    ].split("class ProxboxClusterSyncStateSerializer", 1)[0]
+    assert '"proxmox_endpoint_raw_id"' in device_serializer
     assert "proxbox_storage = RestrictedNestedProxmoxStorageSerializer" in serializers
     assert "class _ParentRestrictedSyncStateViewSetMixin" in views
     assert "class _RelationRestrictedSyncStateViewSetMixin" in views
@@ -127,6 +131,26 @@ def test_sync_state_filtersets_and_tables_exist() -> None:
         assert f"class {model_name}FilterSet" in filtersets
         assert f"class {model_name}Table" in tables
         assert f"{model_name}Table" in tables_init
+    device_filterset = filtersets.split("class ProxboxDeviceSyncStateFilterSet", 1)[
+        1
+    ].split("class ProxboxClusterSyncStateFilterSet", 1)[0]
+    assert '"proxmox_endpoint_raw_id"' in device_filterset
+    assert "filter_proxmox_endpoint_raw_id" in device_filterset
+    assert "Q(proxmox_endpoint_raw_id=value)" in device_filterset
+    assert "Q(proxmox_endpoint_raw_id__isnull=True)" in device_filterset
+
+
+def test_device_endpoint_scope_migration_leaves_historical_rows_unclaimed() -> None:
+    migration = _read_migration("device_sync_scope_and_netbox_token_approval")
+    assert '"proxboxdevicesyncstate"' in migration
+    assert '"proxmox_endpoint_raw_id"' in migration
+    assert "add_field_idempotent" in migration
+    assert "ProxboxVirtualMachineSyncState" not in migration
+    assert "raw_ids_by_endpoint" not in migration
+    assert ".update(proxmox_endpoint_raw_id=" not in migration
+    assert "Historical backend IDs do" in migration
+    assert 'approved_connection_target_fingerprint=""' in migration
+    assert "migrations.RunPython.noop" in migration
 
 
 def test_sync_state_migrations_pin_schema_and_backfill() -> None:

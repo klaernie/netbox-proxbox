@@ -149,6 +149,13 @@ including a switch back to `{node}`. Operator-assigned names are preserved.
 
 !!! tip "Operational verbs"
     `allow_writes` does **not** gate any of the read-side sync paths. It only controls the POST verb routes (`/proxmox/qemu/{vmid}/{start,stop,snapshot,migrate}` and the LXC equivalents) on the paired `proxbox-api`. See [Operational verbs design](../design/operational-verbs.md) and the [Endpoint Operations API](./operations.md).
+    All operational dispatches first require an enabled endpoint, bind the
+    caller's exact ObjectPermission-scoped NetBox endpoint, and translate its
+    primary key to proxbox-api's independent endpoint ID. Missing translations
+    fail locally; the plugin never sends the NetBox primary key as a fallback.
+    Firewall previews additionally send a one-endpoint
+    `proxmox_endpoint_ids` scope and reject returned state carrying another
+    endpoint identity.
 
 !!! warning "Packer template builds need both gates"
     Enabling `allow_writes` alone does not authorize a template bake. The same
@@ -157,20 +164,35 @@ including a switch back to `{node}`. Operator-assigned names are preserved.
     until both flags are enabled; proxbox-api independently returns
     `packer_template_builds_disabled_for_endpoint` if the narrow capability is
     absent or revoked. `POST .../build-pve-template/` and
-    `POST .../cloud-image-build-pipeline/` additionally require
-    `core.run_proxmox_action`; both check the three endpoint gates before any
-    backend call and translate the URL's NetBox endpoint ID to proxbox-api's
-    separate endpoint ID. A failed backend revocation leaves the read-only
-    confirmed flag true and causes single or bulk REST deletion to return 409.
+    `POST .../cloud-image-build-pipeline/` additionally require the
+    `run_proxmox_action` ObjectPermission action on the URL's exact Proxmox
+    endpoint and a write-enabled API token when token authentication is used.
+    These custom POST actions also retain NetBox's existing endpoint `add`
+    object scope, so template-build API operators need both `add` and
+    `run_proxmox_action` on the selected endpoint.
+    Both check the three endpoint gates before any backend call and translate
+    the URL's NetBox endpoint ID to proxbox-api's separate endpoint ID. Grant
+    the action on the *Proxbox > Proxmox endpoint* object type, optionally with
+    an endpoint constraint such as `{"pk": 17}`. A failed backend revocation
+    leaves the read-only confirmed flag true and causes single or bulk REST
+    deletion to return 409. The literal `core.run_proxmox_action` remains a
+    deprecated compatibility path and should not be used for new grants.
 
 ### Connection target authority
 
 The Proxmox and NetBox detail APIs expose a `connection-authority/` action.
 GET returns secret-free target metadata, its fingerprint, and approval state.
+For remote NetBox endpoints, the metadata and fingerprint include
+`token_identity`: the selected v1 token record ID or effective v2 token key,
+chosen by the effective `token_version`. The v2 identity is the explicit
+`token_key`, or the linked v2 token's key when the explicit field is blank,
+matching the payload selector. They never include `token_secret`.
 PUT accepts only the reviewed `target_fingerprint` and requires sensitive-data
 access plus independent object view/change permission and a write-enabled API
 token. Missing or stale approval blocks backend credential payloads before
-resolution. Migration 0105 does not trust existing targets automatically.
+resolution. Migration 0106 clears existing remote NetBox endpoint approvals so
+operators explicitly reapprove the newly token-bound fingerprint; Proxmox
+endpoint fingerprints and approvals remain unchanged.
 See [Connection target approval](../features/endpoint-import-export.md#connection-target-approval).
 
 !!! tip "Endpoint SSH terminal credentials"

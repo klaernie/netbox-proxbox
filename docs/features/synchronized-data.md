@@ -49,6 +49,22 @@ and the fallback text/raw ID is retained. Legacy backend IDs are stored as raw
 data: `proxmox_endpoint_id` becomes `proxmox_endpoint_raw_id`, and
 `proxmox_cluster_id` becomes `proxmox_cluster_raw_id`.
 
+Device and VM sidecars both store the proxbox-api database's
+`proxmox_endpoint_raw_id`. When the device endpoint receives that filter, it
+returns rows with the exact value plus legacy rows whose value is null. A
+non-null value is exclusive: rows stamped for another backend endpoint are
+never returned. Null rows are unclaimed candidates, never ownership proof.
+Every consumer must corroborate the candidate's actual cluster, site, and
+placement before adoption, including when the query returns only one null row.
+The paired proxbox-api `0.0.27.post3` enforces that corroboration and must stamp
+its current endpoint ID when it adopts a null row or creates a sidecar. The
+plugin serializes claims under a database row lock: the first NULL-to-ID claim
+wins, and changing a committed non-null ID returns HTTP 409 with
+`code=endpoint_ownership_conflict`.
+Migration 0106 deliberately leaves every existing device row null because VM
+history cannot establish current backend ownership after restore, reseed, or
+backend ID reuse.
+
 `ProxboxClusterSyncState` is a separate sidecar instead of new columns on
 `ProxmoxCluster` because `ProxmoxCluster` is endpoint-scoped and only has a
 nullable FK to the core NetBox cluster. A single NetBox cluster is not guaranteed

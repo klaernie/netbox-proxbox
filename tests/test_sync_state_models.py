@@ -652,6 +652,68 @@ class ProxboxSyncStateAPITest(_SyncStateFixturesMixin, TestCase):
         row.refresh_from_db()
         self.assertEqual(row.proxmox_status, "stopped")
 
+    def test_device_sync_state_endpoint_scope_round_trip(self) -> None:
+        url = reverse("plugins-api:netbox_proxbox-api:proxboxdevicesyncstate-list")
+        response = self.client.post(
+            url,
+            data=json.dumps(
+                {
+                    "device": {"id": self.device_for_api.pk},
+                    "endpoint": {"id": self.endpoint.pk},
+                    "proxmox_node_name": "pve-node-sync",
+                    "proxmox_cluster_name": "pve-sync",
+                    "proxmox_endpoint_raw_id": 701,
+                }
+            ),
+            content_type="application/json",
+            **self._auth_headers(),
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(response.json()["proxmox_endpoint_raw_id"], 701)
+        row = ProxboxDeviceSyncState.objects.get(device=self.device_for_api)
+        self.assertEqual(row.proxmox_endpoint_raw_id, 701)
+        detail_url = reverse(
+            "plugins-api:netbox_proxbox-api:proxboxdevicesyncstate-detail",
+            args=[row.pk],
+        )
+        detail_response = self.client.get(detail_url, **self._auth_headers())
+        self.assertEqual(detail_response.status_code, 200, detail_response.content)
+        self.assertEqual(detail_response.json()["proxmox_endpoint_raw_id"], 701)
+
+    def test_device_sync_state_api_scope_includes_unclaimed_legacy_only(self) -> None:
+        exact_device = create_test_device("sync-state-api-scope-exact")
+        other_device = create_test_device("sync-state-api-scope-other")
+        exact = ProxboxDeviceSyncState.objects.create(
+            device=exact_device,
+            proxmox_node_name="pve-node-sync",
+            proxmox_cluster_name="pve-sync",
+            proxmox_endpoint_raw_id=701,
+        )
+        ProxboxDeviceSyncState.objects.create(
+            device=other_device,
+            proxmox_node_name="pve-node-sync",
+            proxmox_cluster_name="pve-sync",
+            proxmox_endpoint_raw_id=702,
+        )
+        legacy = ProxboxDeviceSyncState.objects.get(device=self.device)
+        self.assertIsNone(legacy.proxmox_endpoint_raw_id)
+
+        url = reverse("plugins-api:netbox_proxbox-api:proxboxdevicesyncstate-list")
+        response = self.client.get(
+            url,
+            {
+                "proxmox_node_name": "pve-node-sync",
+                "proxmox_cluster_name": "pve-sync",
+                "proxmox_endpoint_raw_id": "701",
+            },
+            **self._auth_headers(),
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(
+            {row["id"] for row in response.json()["results"]},
+            {exact.pk, legacy.pk},
+        )
+
     def test_vm_sync_state_etag_advances_and_rejects_stale_if_match(self) -> None:
         row = ProxboxVirtualMachineSyncState.objects.get(virtual_machine=self.vm)
         detail_url = reverse(

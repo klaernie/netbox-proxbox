@@ -19,19 +19,22 @@ import requests
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.views import View
-from utilities.views import (
-    ContentTypePermissionRequiredMixin,
-    TokenConditionalLoginRequiredMixin,
-    register_model_view,
-)
+from utilities.views import TokenConditionalLoginRequiredMixin, register_model_view
 from virtualization.models import VirtualMachine
 
 from netbox_proxbox.models import ProxmoxCluster, ProxmoxEndpoint, ProxmoxNode
 from netbox_proxbox.services._endpoint_errors import translate_request_exception
-from netbox_proxbox.services.backend_context import get_fastapi_request_context
+from netbox_proxbox.services.endpoint_enabled import endpoint_is_enabled
+from netbox_proxbox.services.operational_target import (
+    OperationalTargetError,
+    resolve_operational_target,
+)
 from netbox_proxbox.services.individual_sync import sync_individual
-from netbox_proxbox.views.backend_sync import resolve_backend_endpoint_id
-from netbox_proxbox.views.proxbox_access import permission_run_proxmox_action
+from netbox_proxbox.views.proxbox_access import (
+    EndpointOperationalPermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    user_can_run_endpoint_action,
+)
 
 logger = logging.getLogger("netbox_proxbox.views.proxmox_create_instance")
 
@@ -101,7 +104,9 @@ class CreateInstanceValidationError(ValueError):
 
 def endpoint_allows_instance_create(endpoint: object) -> bool:
     """Return whether this endpoint is locally allowed to perform writes."""
-    return bool(getattr(endpoint, "allow_writes", False))
+    return endpoint_is_enabled(endpoint) and bool(
+        getattr(endpoint, "allow_writes", False)
+    )
 
 
 def build_provision_headers(
@@ -270,16 +275,13 @@ def is_vmid_collision_response(response: object) -> bool:
 @register_model_view(ProxmoxEndpoint, "create_instance", path="create-instance")
 class ProxmoxEndpointCreateInstanceView(
     TokenConditionalLoginRequiredMixin,
-    ContentTypePermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    EndpointOperationalPermissionRequiredMixin,
     View,
 ):
     """POST: create a QEMU VM or LXC container from a selected endpoint template."""
 
     http_method_names: ClassVar[list[str]] = ["post"]
-
-    def get_required_permission(self) -> str:
-        """Return the Proxmox action permission codename."""
-        return permission_run_proxmox_action()
 
     def post(self, request: HttpRequest, pk: int | str) -> JsonResponse:
         """Validate input, call proxbox-api, and sync the new instance into NetBox."""
@@ -287,6 +289,14 @@ class ProxmoxEndpointCreateInstanceView(
             ProxmoxEndpoint.objects.restrict(request.user, "view"),
             pk=pk,
         )
+        if not user_can_run_endpoint_action(request.user, endpoint.pk):
+            return get_object_or_404(ProxmoxEndpoint.objects.none(), pk=pk)
+        if not endpoint_is_enabled(endpoint):
+            return _json_error(
+                "endpoint_disabled",
+                "Enable this endpoint before creating instances.",
+                status=403,
+            )
         if not endpoint_allows_instance_create(endpoint):
             return _json_error(
                 "writes_disabled_for_endpoint",
@@ -302,31 +312,19 @@ class ProxmoxEndpointCreateInstanceView(
         except CreateInstanceValidationError as exc:
             return _json_error(exc.reason, exc.detail, status=exc.status_code)
 
-        ctx = get_fastapi_request_context()
-        if ctx is None or not ctx.http_url:
+        try:
+            target = resolve_operational_target(endpoint=endpoint, user=request.user)
+        except OperationalTargetError as exc:
             return _json_error(
-                "fastapi_endpoint_required",
-                "No enabled ProxBox (FastAPI) backend is configured.",
-                status=503,
+                exc.reason,
+                exc.detail,
+                status=exc.status_code,
             )
 
+        ctx = target.context
         base_url = ctx.http_url.rstrip("/")
         base_headers = dict(ctx.headers or {})
         verify_ssl = bool(ctx.verify_ssl)
-        backend_endpoint_id, resolve_error = resolve_backend_endpoint_id(
-            endpoint,
-            base_url=base_url,
-            auth_headers=base_headers,
-            backend_verify_ssl=verify_ssl,
-        )
-        if backend_endpoint_id is None:
-            return _json_error(
-                "backend_endpoint_unresolved",
-                resolve_error
-                or "Could not resolve this endpoint on the ProxBox backend.",
-                status=502,
-            )
-
         headers = build_provision_headers(
             base_headers, getattr(getattr(request, "user", None), "username", "")
         )
@@ -335,7 +333,7 @@ class ProxmoxEndpointCreateInstanceView(
                 request,
                 endpoint=endpoint,
                 normalized=normalized,
-                backend_endpoint_id=backend_endpoint_id,
+                backend_endpoint_id=target.backend_endpoint_id,
                 fastapi_endpoint_id=ctx.endpoint_id,
                 base_url=base_url,
                 headers=headers,
@@ -345,7 +343,7 @@ class ProxmoxEndpointCreateInstanceView(
             request,
             endpoint=endpoint,
             normalized=normalized,
-            backend_endpoint_id=backend_endpoint_id,
+            backend_endpoint_id=target.backend_endpoint_id,
             fastapi_endpoint_id=ctx.endpoint_id,
             base_url=base_url,
             headers=headers,

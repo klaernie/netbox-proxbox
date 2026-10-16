@@ -1,5 +1,7 @@
 """Define NetBox forms for Proxmox endpoint objects and list filtering."""
 
+from dataclasses import dataclass
+
 # Django Imports
 from django import forms
 from django.core.exceptions import ValidationError
@@ -42,6 +44,75 @@ from ..models.ssh_credential import (
     SSH_CRED_SOURCE_REUSE,
 )
 from ..validators import validate_endpoint_node_device_name_template
+
+
+@dataclass(frozen=True)
+class _SSHSecretPresence:
+    """Final dedicated SSH secret availability after submitted clear flags."""
+
+    password: bool
+    private_key: bool
+
+
+def _credential_source(cleaned_data: dict[str, object], instance: object) -> str:
+    """Return the submitted or stored endpoint SSH credential source."""
+    return str(
+        cleaned_data.get("ssh_credential_source")
+        or getattr(instance, "ssh_credential_source", SSH_CRED_SOURCE_DEDICATED)
+        or SSH_CRED_SOURCE_DEDICATED
+    )
+
+
+def _secret_available(
+    submitted: object,
+    stored: object,
+    *,
+    clear: bool,
+) -> bool:
+    """Return final secret availability after replacement and clear intent."""
+    return bool(submitted) or (bool(stored) and not clear)
+
+
+def _dedicated_ssh_secret_presence(
+    cleaned_data: dict[str, object],
+    instance: object,
+    *,
+    uses_openbao: bool,
+) -> _SSHSecretPresence:
+    """Resolve final dedicated SSH password and private-key availability."""
+    stored_password = bool(getattr(instance, "ssh_password_enc", "")) or (
+        uses_openbao
+        and bool(getattr(instance, "openbao_ssh_password_credential_uuid", None))
+    )
+    stored_private_key = bool(getattr(instance, "ssh_private_key_enc", "")) or (
+        uses_openbao
+        and bool(getattr(instance, "openbao_ssh_keypair_credential_uuid", None))
+    )
+    return _SSHSecretPresence(
+        password=_secret_available(
+            cleaned_data.get("ssh_password"),
+            stored_password,
+            clear=bool(cleaned_data.get("clear_ssh_password")),
+        ),
+        private_key=_secret_available(
+            cleaned_data.get("ssh_private_key"),
+            stored_private_key,
+            clear=bool(cleaned_data.get("clear_ssh_private_key")),
+        ),
+    )
+
+
+def _submitted_or_stored_endpoint_password(
+    cleaned_data: dict[str, object], instance: object
+) -> object:
+    """Return a submitted endpoint password or fail-closed stored resolution."""
+    password = cleaned_data.get("password")
+    if password is not None:
+        return password
+    try:
+        return getattr(instance, "password", "")
+    except (enc_helpers.EncryptionError, ValidationError):
+        return ""
 
 
 class ProxmoxEndpointSSHCredentialFormMixin(forms.Form):
@@ -140,84 +211,61 @@ class ProxmoxEndpointSSHCredentialFormMixin(forms.Form):
             self._clean_ssh_credentials()
         return cleaned_data
 
+    def _post_clean(self) -> None:
+        """Expose a submitted endpoint password only while the model validates.
+
+        The password form field is write-only and is not copied to the model by
+        Django's ``construct_instance()``. Reuse validation still belongs to
+        ``ProxmoxEndpoint.clean()``, so provide its final form candidate through
+        a transient attribute and remove the plaintext even when validation
+        raises.
+        """
+        password_supplied = "password" in self.cleaned_data
+        if password_supplied:
+            self.instance._pending_password_for_validation = self.cleaned_data[
+                "password"
+            ]
+        try:
+            super()._post_clean()
+        finally:
+            if password_supplied:
+                del self.instance._pending_password_for_validation
+
     def _clean_ssh_credentials(self) -> None:
         """Validate the selected endpoint SSH credential source."""
         cleaned_data = self.cleaned_data
         instance = self.instance
-
-        credential_source = (
-            cleaned_data.get("ssh_credential_source")
-            or getattr(
-                instance,
-                "ssh_credential_source",
-                SSH_CRED_SOURCE_DEDICATED,
-            )
-            or SSH_CRED_SOURCE_DEDICATED
-        )
+        credential_source = _credential_source(cleaned_data, instance)
         fingerprint = (cleaned_data.get("ssh_known_host_fingerprint") or "").strip()
 
         if credential_source == SSH_CRED_SOURCE_REUSE:
-            endpoint_password = cleaned_data.get("password")
-            if endpoint_password is None:
-                try:
-                    endpoint_password = getattr(instance, "password", "")
-                except (enc_helpers.EncryptionError, ValidationError):
-                    endpoint_password = ""
-            if not endpoint_password:
-                self.add_error(
-                    "ssh_credential_source",
-                    _(
-                        "Reusing endpoint credentials for SSH requires this "
-                        "endpoint to store a password; token-only endpoints "
-                        "cannot reuse SSH credentials."
-                    ),
-                )
-            if not fingerprint:
-                self.add_error(
-                    "ssh_known_host_fingerprint",
-                    _(
-                        "Pinned host-key fingerprint is required when reusing "
-                        "endpoint credentials for SSH."
-                    ),
-                )
+            # ``ProxmoxEndpoint.clean()`` owns reuse validation. ``_post_clean``
+            # supplies the pending write-only password for create and rotation.
             return
 
-        password = cleaned_data.get("ssh_password") or ""
-        private_key = cleaned_data.get("ssh_private_key") or ""
-        clear_password = bool(cleaned_data.get("clear_ssh_password"))
-        clear_private_key = bool(cleaned_data.get("clear_ssh_private_key"))
         from netbox_proxbox.integrations.openbao import endpoint_uses_openbao_storage
 
         uses_openbao = endpoint_uses_openbao_storage(instance)
-        has_password = bool(password) or (
-            (
-                bool(getattr(instance, "ssh_password_enc", ""))
-                or (
-                    uses_openbao
-                    and bool(
-                        getattr(instance, "openbao_ssh_password_credential_uuid", None)
-                    )
-                )
-            )
-            and not clear_password
+        presence = _dedicated_ssh_secret_presence(
+            cleaned_data,
+            instance,
+            uses_openbao=uses_openbao,
         )
-        has_private_key = bool(private_key) or (
-            (
-                bool(getattr(instance, "ssh_private_key_enc", ""))
-                or (
-                    uses_openbao
-                    and bool(
-                        getattr(instance, "openbao_ssh_keypair_credential_uuid", None)
-                    )
-                )
-            )
-            and not clear_private_key
-        )
-
-        username = (cleaned_data.get("ssh_username") or "").strip()
-        has_any = any((username, fingerprint, has_password, has_private_key))
-        if not has_any:
+        if not self._validate_dedicated_ssh_identity(presence, fingerprint):
             return
+        self._validate_dedicated_ssh_auth(presence)
+        self._validate_dedicated_ssh_storage(uses_openbao=uses_openbao)
+
+    def _validate_dedicated_ssh_identity(
+        self,
+        presence: _SSHSecretPresence,
+        fingerprint: str,
+    ) -> bool:
+        """Validate dedicated SSH identity fields and return whether configured."""
+        username = (self.cleaned_data.get("ssh_username") or "").strip()
+        has_any = any((username, fingerprint, presence.password, presence.private_key))
+        if not has_any:
+            return False
 
         if not username:
             self.add_error(
@@ -229,18 +277,26 @@ class ProxmoxEndpointSSHCredentialFormMixin(forms.Form):
                 "ssh_known_host_fingerprint",
                 _("Pinned host-key fingerprint is required for endpoint fallback SSH."),
             )
+        return True
 
-        auth_method = cleaned_data.get("ssh_auth_method")
-        if auth_method == AUTH_METHOD_KEY and not has_private_key:
+    def _validate_dedicated_ssh_auth(self, presence: _SSHSecretPresence) -> None:
+        """Require the secret selected by the dedicated SSH auth method."""
+        auth_method = self.cleaned_data.get("ssh_auth_method")
+        if auth_method == AUTH_METHOD_KEY and not presence.private_key:
             self.add_error(
                 "ssh_private_key",
                 _("Key authentication requires a stored SSH private key."),
             )
-        if auth_method == AUTH_METHOD_PASSWORD and not has_password:
+        if auth_method == AUTH_METHOD_PASSWORD and not presence.password:
             self.add_error(
                 "ssh_password",
                 _("Password authentication requires a stored SSH password."),
             )
+
+    def _validate_dedicated_ssh_storage(self, *, uses_openbao: bool) -> None:
+        """Require local encryption before accepting new dedicated SSH material."""
+        password = self.cleaned_data.get("ssh_password") or ""
+        private_key = self.cleaned_data.get("ssh_private_key") or ""
         if (
             (password or private_key)
             and not uses_openbao
@@ -259,72 +315,105 @@ class ProxmoxEndpointSSHCredentialFormMixin(forms.Form):
         instance = super().save(commit=False)
         from netbox_proxbox.integrations.openbao import endpoint_uses_openbao_storage
 
+        uses_openbao = endpoint_uses_openbao_storage(instance)
+        self._attach_ssh_save_actor(instance)
+        if commit and uses_openbao and not instance.pk:
+            instance.save()
+        self._apply_primary_secret_inputs(instance)
+
+        if self.cleaned_data.get("ssh_credential_source") == SSH_CRED_SOURCE_REUSE:
+            return self._commit_ssh_form(instance, commit=commit)
+
+        key = ProxboxPluginSettings.get_solo().encryption_key or ""
+        self._clear_dedicated_ssh_secret(
+            instance,
+            uses_openbao=uses_openbao,
+            clear_field="clear_ssh_password",
+            reference_field="openbao_ssh_password_credential_uuid",
+            encrypted_field="ssh_password_enc",
+        )
+        self._clear_dedicated_ssh_secret(
+            instance,
+            uses_openbao=uses_openbao,
+            clear_field="clear_ssh_private_key",
+            reference_field="openbao_ssh_keypair_credential_uuid",
+            encrypted_field="ssh_private_key_enc",
+        )
+        self._apply_dedicated_ssh_secret_inputs(instance, key=key)
+        return self._commit_ssh_form(instance, commit=commit)
+
+    def _attach_ssh_save_actor(self, instance: ProxmoxEndpoint) -> None:
+        """Attach the request actor used by provider-owned credential writes."""
         if self._request_user is not None:
             instance._openbao_actor_user = self._request_user
 
-        uses_openbao = endpoint_uses_openbao_storage(instance)
-        if commit and uses_openbao and not instance.pk:
-            instance.save()
+    def _apply_primary_secret_inputs(self, instance: ProxmoxEndpoint) -> None:
+        """Apply endpoint API secret replacements and explicit clears."""
+        self._apply_primary_secret_input(
+            instance,
+            field="password",
+            clear_field="clear_password",
+        )
+        self._apply_primary_secret_input(
+            instance,
+            field="token_value",
+            clear_field="clear_token",
+        )
 
-        if "password" in self.cleaned_data:
-            if self.cleaned_data.get("clear_password"):
-                instance.password = ""
-            else:
-                password = self.cleaned_data.get("password")
-                if password:
-                    instance.password = password
-        if "token_value" in self.cleaned_data:
-            if self.cleaned_data.get("clear_token"):
-                instance.token_value = ""
-            else:
-                token_value = self.cleaned_data.get("token_value")
-                if token_value:
-                    instance.token_value = token_value
+    def _apply_primary_secret_input(
+        self,
+        instance: ProxmoxEndpoint,
+        *,
+        field: str,
+        clear_field: str,
+    ) -> None:
+        """Apply one primary API secret without disturbing a blank edit input."""
+        if field not in self.cleaned_data:
+            return
+        if self.cleaned_data.get(clear_field):
+            setattr(instance, field, "")
+            return
+        value = self.cleaned_data.get(field)
+        if value:
+            setattr(instance, field, value)
 
-        if self.cleaned_data.get("ssh_credential_source") == SSH_CRED_SOURCE_REUSE:
-            if commit:
-                instance.save()
-                self.save_m2m()
-            return instance
-
-        key = ProxboxPluginSettings.get_solo().encryption_key or ""
-
-        if self.cleaned_data.get("clear_ssh_password"):
+    def _clear_dedicated_ssh_secret(
+        self,
+        instance: ProxmoxEndpoint,
+        *,
+        uses_openbao: bool,
+        clear_field: str,
+        reference_field: str,
+        encrypted_field: str,
+    ) -> None:
+        """Apply one dedicated SSH clear through its selected storage backend."""
+        if not self.cleaned_data.get(clear_field):
+            return
+        if uses_openbao:
             from netbox_proxbox.integrations.openbao import (
                 clear_endpoint_openbao_credential,
-                endpoint_uses_openbao_storage as _uses_openbao,
-            )
-            from netbox_proxbox.services.encryption_recovery import (
-                mark_encrypted_fields_for_write,
             )
 
-            if _uses_openbao(instance):
-                clear_endpoint_openbao_credential(
-                    instance,
-                    "openbao_ssh_password_credential_uuid",
-                    user=self._request_user,
-                )
-            else:
-                mark_encrypted_fields_for_write(instance, "ssh_password_enc")
-                instance.ssh_password_enc = ""
-        if self.cleaned_data.get("clear_ssh_private_key"):
-            from netbox_proxbox.integrations.openbao import (
-                clear_endpoint_openbao_credential,
-                endpoint_uses_openbao_storage as _uses_openbao,
+            clear_endpoint_openbao_credential(
+                instance,
+                reference_field,
+                user=self._request_user,
             )
-            from netbox_proxbox.services.encryption_recovery import (
-                mark_encrypted_fields_for_write,
-            )
+            return
+        from netbox_proxbox.services.encryption_recovery import (
+            mark_encrypted_fields_for_write,
+        )
 
-            if _uses_openbao(instance):
-                clear_endpoint_openbao_credential(
-                    instance,
-                    "openbao_ssh_keypair_credential_uuid",
-                    user=self._request_user,
-                )
-            else:
-                mark_encrypted_fields_for_write(instance, "ssh_private_key_enc")
-                instance.ssh_private_key_enc = ""
+        mark_encrypted_fields_for_write(instance, encrypted_field)
+        setattr(instance, encrypted_field, "")
+
+    def _apply_dedicated_ssh_secret_inputs(
+        self,
+        instance: ProxmoxEndpoint,
+        *,
+        key: str,
+    ) -> None:
+        """Encrypt nonblank dedicated SSH password and private-key inputs."""
         password = self.cleaned_data.get("ssh_password") or ""
         private_key = self.cleaned_data.get("ssh_private_key") or ""
         if password:
@@ -332,6 +421,13 @@ class ProxmoxEndpointSSHCredentialFormMixin(forms.Form):
         if private_key:
             instance.set_ssh_private_key(private_key, key=key)
 
+    def _commit_ssh_form(
+        self,
+        instance: ProxmoxEndpoint,
+        *,
+        commit: bool,
+    ) -> ProxmoxEndpoint:
+        """Persist the endpoint and form relations when requested."""
         if commit:
             instance.save()
             self.save_m2m()
@@ -744,11 +840,7 @@ class ProxmoxEndpointForm(ProxmoxEndpointSSHCredentialFormMixin, NetBoxModelForm
         """Return whether submitted endpoint SSH credentials are complete."""
         cleaned_data = self.cleaned_data
         instance = self.instance
-        credential_source = (
-            cleaned_data.get("ssh_credential_source")
-            or getattr(instance, "ssh_credential_source", SSH_CRED_SOURCE_DEDICATED)
-            or SSH_CRED_SOURCE_DEDICATED
-        )
+        credential_source = _credential_source(cleaned_data, instance)
         domain = cleaned_data.get("domain") or getattr(instance, "domain", "") or ""
         ip_address = cleaned_data.get("ip_address") or getattr(
             instance,
@@ -759,50 +851,46 @@ class ProxmoxEndpointForm(ProxmoxEndpointSSHCredentialFormMixin, NetBoxModelForm
         fingerprint = (cleaned_data.get("ssh_known_host_fingerprint") or "").strip()
 
         if credential_source == SSH_CRED_SOURCE_REUSE:
-            username = (
-                cleaned_data.get("username") or getattr(instance, "username", "") or ""
-            )
-            effective_username = str(username).split("@", 1)[0].strip()
-            password = cleaned_data.get("password")
-            if password is None:
-                try:
-                    password = getattr(instance, "password", "")
-                except (enc_helpers.EncryptionError, ValidationError):
-                    password = ""
-            return bool(host and fingerprint and effective_username and password)
+            return self._reused_monitoring_credentials_ready(host, fingerprint)
+        return self._dedicated_monitoring_credentials_ready(host, fingerprint)
 
-        username = (cleaned_data.get("ssh_username") or "").strip()
-        clear_password = bool(cleaned_data.get("clear_ssh_password"))
-        clear_private_key = bool(cleaned_data.get("clear_ssh_private_key"))
+    def _reused_monitoring_credentials_ready(
+        self,
+        host: str,
+        fingerprint: str,
+    ) -> bool:
+        """Return reuse-mode monitoring readiness from final form values."""
+        username = (
+            self.cleaned_data.get("username")
+            or getattr(self.instance, "username", "")
+            or ""
+        )
+        effective_username = str(username).split("@", 1)[0].strip()
+        password = _submitted_or_stored_endpoint_password(
+            self.cleaned_data,
+            self.instance,
+        )
+        return bool(host and fingerprint and effective_username and password)
+
+    def _dedicated_monitoring_credentials_ready(
+        self,
+        host: str,
+        fingerprint: str,
+    ) -> bool:
+        """Return dedicated-mode monitoring readiness from final form values."""
+        username = (self.cleaned_data.get("ssh_username") or "").strip()
         from netbox_proxbox.integrations.openbao import endpoint_uses_openbao_storage
 
-        uses_openbao = endpoint_uses_openbao_storage(instance)
-        has_password = bool(cleaned_data.get("ssh_password")) or (
-            (
-                bool(getattr(instance, "ssh_password_enc", ""))
-                or (
-                    uses_openbao
-                    and bool(
-                        getattr(instance, "openbao_ssh_password_credential_uuid", None)
-                    )
-                )
-            )
-            and not clear_password
+        presence = _dedicated_ssh_secret_presence(
+            self.cleaned_data,
+            self.instance,
+            uses_openbao=endpoint_uses_openbao_storage(self.instance),
         )
-        has_private_key = bool(cleaned_data.get("ssh_private_key")) or (
-            (
-                bool(getattr(instance, "ssh_private_key_enc", ""))
-                or (
-                    uses_openbao
-                    and bool(
-                        getattr(instance, "openbao_ssh_keypair_credential_uuid", None)
-                    )
-                )
-            )
-            and not clear_private_key
+        has_secret = (
+            presence.private_key
+            if self.cleaned_data.get("ssh_auth_method") == AUTH_METHOD_KEY
+            else presence.password
         )
-        auth_method = cleaned_data.get("ssh_auth_method")
-        has_secret = has_private_key if auth_method == AUTH_METHOD_KEY else has_password
         return bool(host and username and fingerprint and has_secret)
 
 

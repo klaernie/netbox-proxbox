@@ -12,11 +12,41 @@ independent view/change access. Migration `0104_security_hardening`
 leaves existing approvals blank. FastAPI target changes additionally require
 sensitive authority before its existing authentication/adoption flow; disabled
 backend target edits remain drafts.
+The device sync-state serializer and filterset expose
+`proxmox_endpoint_raw_id`. A stamped value is endpoint-exclusive. A NULL result
+is only an unclaimed candidate, never ownership proof; consumers must
+corroborate actual cluster, site, and placement even for a singleton before
+adoption. Device-sidecar claims run under a row lock: NULL-to-ID and same-ID
+writes are allowed, while changing a committed ID returns HTTP 409 with
+`code=endpoint_ownership_conflict`. Successful updates snapshot the locked
+pre-change state and retain NetBox's submitted changelog message; rejected
+claims do not emit an ObjectChange. Connection-authority responses expose only
+the effective remote NetBox token identity, never its secret.
 
 
 Keep API behavior typed, permission-gated, and vendor-neutral. Use NetBox
 serializers and viewsets for model resources. Operational endpoints must state
 their permission, transport, failure, and secret-handling behavior in tests.
+Operational tags, firewall, and template-build actions require the
+`run_proxmox_action` ObjectPermission action on the exact owning
+`ProxmoxEndpoint`; the literal `core.run_proxmox_action` is a deprecated
+additive compatibility path. Every unsafe token-authenticated operational
+request requires `write_enabled=True`. Custom action permission lists must not
+drop this token scope check.
+Authorization and routing are one decision: operational tags, firewall,
+template-build, and create-instance actions bind the exact enabled endpoint
+through `services/operational_target.py` and dispatch only with its translated
+proxbox-api endpoint ID. Firewall previews must also send the one-endpoint
+`enabled_backend_endpoint_scope()` params and reject response state carrying a
+different endpoint identity. Disabled endpoints must return locally before
+backend context resolution or HTTP dispatch.
+
+The per-VM HA route requires the `virtual_machine_id` query parameter. Resolve
+that NetBox VM through `VirtualMachine.objects.restrict(user, "view")`, verify
+its synchronized Proxmox VM ID matches the path `vmid`, and query only its
+single typed, enabled endpoint after endpoint object-permission restriction.
+Missing, malformed, unknown, hidden, inconsistent, disabled, or unresolved VM
+identity must return HTTP 400 before any backend request.
 
 Secret-returning endpoints must require an authenticated API token with the
 specific object permission and HTTPS outside development mode. Explicit

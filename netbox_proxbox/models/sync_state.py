@@ -171,6 +171,7 @@ class ProxboxDeviceSyncState(ProxboxSyncStateBase):
         related_name="device_sync_states",
     )
     proxmox_cluster_name = models.CharField(max_length=255, blank=True)
+    proxmox_endpoint_raw_id = models.IntegerField(null=True, blank=True)
 
     proxmox_link = models.URLField(max_length=500, blank=True)
     proxmox_tags = models.TextField(blank=True)

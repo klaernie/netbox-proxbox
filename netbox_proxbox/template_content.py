@@ -31,10 +31,11 @@ from netbox_proxbox.models import (
     VMSnapshot,
     VMTaskHistory,
 )
+from netbox_proxbox.services.endpoint_enabled import endpoint_is_enabled
 from netbox_proxbox.views.operational import resolve_vm_endpoint_context
 from netbox_proxbox.views.proxbox_access import (
     permission_enqueue_proxbox_sync,
-    permission_run_proxmox_action,
+    user_can_run_endpoint_action,
 )
 from netbox_proxbox.branch_intent_template import branch_intent_template_extensions
 
@@ -571,10 +572,10 @@ class ProxboxVirtualMachineTemplateExtension(PluginTemplateExtension):
                         },
                     )
                 )
-        if user.has_perm(permission_run_proxmox_action()):
-            resolved = resolve_vm_endpoint_context(obj)
-            if resolved is not None:
-                endpoint_id, _vmid, _vm_type = resolved
+        resolved = resolve_vm_endpoint_context(obj)
+        if resolved is not None:
+            endpoint_id, _vmid, _vm_type = resolved
+            if user_can_run_endpoint_action(user, endpoint_id):
                 from netbox_proxbox.models import ProxmoxEndpoint
 
                 endpoint = ProxmoxEndpoint.objects.filter(pk=endpoint_id).first()
@@ -757,9 +758,13 @@ class ProxmoxFirewallPushTemplateExtension(PluginTemplateExtension):
         if not isinstance(obj, self.model_classes):
             return ""
         user = self.context["request"].user
-        if not user.has_perm(permission_run_proxmox_action()):
-            return ""
         endpoint = resolve_firewall_endpoint(obj)
+        if (
+            endpoint is None
+            or not endpoint_is_enabled(endpoint)
+            or not user_can_run_endpoint_action(user, endpoint.pk)
+        ):
+            return ""
         allow_writes = bool(endpoint and getattr(endpoint, "allow_writes", False))
         return self.render(
             "netbox_proxbox/inc/firewall_push_button.html",
@@ -777,7 +782,12 @@ class ProxmoxFirewallPushTemplateExtension(PluginTemplateExtension):
         if not isinstance(obj, self.model_classes):
             return ""
         user = self.context["request"].user
-        if not user.has_perm(permission_run_proxmox_action()):
+        endpoint = resolve_firewall_endpoint(obj)
+        if (
+            endpoint is None
+            or not endpoint_is_enabled(endpoint)
+            or not user_can_run_endpoint_action(user, endpoint.pk)
+        ):
             return ""
         return self.render(
             "netbox_proxbox/inc/firewall_preview_panel.html",

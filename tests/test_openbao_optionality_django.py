@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from copy import deepcopy
 import sys
+from threading import Event, Thread
 import types
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +17,78 @@ import pytest
 from tests.test_proxmox_endpoint_allowed_tenants import _require_harness
 
 pytestmark = pytest.mark.django_db
+
+
+class _PrimaryReplicaRouter:
+    def db_for_read(self, _model, **_hints):
+        return "openbao_replica"
+
+    def db_for_write(self, _model, **_hints):
+        return "default"
+
+
+class _SecondaryWriteRouter:
+    def db_for_read(self, _model, **_hints):
+        return "default"
+
+    def db_for_write(self, _model, **_hints):
+        return "openbao_secondary"
+
+
+@contextmanager
+def _independent_secondary_database(test_id: str):
+    """Replace the registered mirror with an independently populated clone."""
+    from django.db import connection, connections
+
+    from tests.django_database_names import disposable_database_name
+    from tests.django_support import (
+        ForwardOnlyMigrationTestCase,
+        _ensure_harness_session,
+    )
+
+    alias = "openbao_secondary"
+    primary_name = str(connection.settings_dict["NAME"])
+    database_name = disposable_database_name("test", test_id)
+    original_settings = deepcopy(connections.databases[alias])
+    _ensure_harness_session()
+    for database in connections.all():
+        database.close()
+        close_pool = getattr(database, "close_pool", None)
+        if close_pool is not None:
+            close_pool()
+    ForwardOnlyMigrationTestCase._switch_default_database("postgres")
+    try:
+        ForwardOnlyMigrationTestCase._create_database(
+            database_name,
+            template=primary_name,
+        )
+    finally:
+        ForwardOnlyMigrationTestCase._switch_default_database(primary_name)
+
+    secondary = connections["default"].copy(alias=alias)
+    secondary.settings_dict["NAME"] = database_name
+    secondary.settings_dict["TEST"] = {
+        **secondary.settings_dict.get("TEST", {}),
+        "MIRROR": None,
+        "NAME": database_name,
+    }
+    connections.databases[alias] = secondary.settings_dict
+    connections[alias] = secondary
+    try:
+        assert connections[alias].settings_dict["NAME"] != primary_name
+        assert connections[alias].settings_dict["TEST"]["MIRROR"] is None
+        yield alias
+    finally:
+        connections[alias].close()
+        connections.databases[alias] = original_settings
+        restored = connections["default"].copy(alias=alias)
+        restored.settings_dict.update(original_settings)
+        connections[alias] = restored
+        ForwardOnlyMigrationTestCase._switch_default_database("postgres")
+        try:
+            ForwardOnlyMigrationTestCase._drop_database(database_name)
+        finally:
+            ForwardOnlyMigrationTestCase._switch_default_database(primary_name)
 
 
 @pytest.fixture
@@ -136,6 +211,153 @@ def test_automatic_settings_form_and_serializer_accept_blank(optionality_models)
     assert serializer.fields["credential_storage_backend"].run_validation("") == ""
 
 
+def test_settings_storage_serializer_create_update_and_patch_contract(
+    optionality_models,
+    settings,
+):
+    from netbox_proxbox.api.serializers.settings import ProxboxPluginSettingsSerializer
+
+    Settings, _Endpoint = optionality_models
+    settings.PLUGINS = ["netbox_proxbox"]
+    Settings.objects.all().delete()
+    create = ProxboxPluginSettingsSerializer(
+        data={"credential_storage_backend": "legacy_encrypted"}
+    )
+    assert create.is_valid(), create.errors
+    configuration = create.save()
+    assert configuration.credential_storage_backend == "legacy_encrypted"
+
+    update = ProxboxPluginSettingsSerializer(
+        configuration,
+        data={"credential_storage_backend": ""},
+    )
+    assert update.is_valid(), update.errors
+    configuration = update.save()
+    assert configuration.credential_storage_backend == ""
+
+    patch = ProxboxPluginSettingsSerializer(
+        configuration,
+        data={"sync_job_timeout": 7201},
+        partial=True,
+    )
+    assert patch.is_valid(), patch.errors
+    configuration = patch.save()
+    assert configuration.credential_storage_backend == ""
+    assert configuration.sync_job_timeout == 7201
+
+    Settings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="openbao"
+    )
+    configuration.refresh_from_db()
+    unchanged = ProxboxPluginSettingsSerializer(
+        configuration,
+        data={"credential_storage_backend": "openbao"},
+    )
+    assert unchanged.is_valid(), unchanged.errors
+    assert unchanged.save().credential_storage_backend == "openbao"
+
+    for forged in ("unknown-provider", "OPENBAO", None, 7):
+        serializer = ProxboxPluginSettingsSerializer(
+            configuration,
+            data={"credential_storage_backend": forged},
+            partial=True,
+        )
+        assert not serializer.is_valid()
+        assert "credential_storage_backend" in serializer.errors
+
+    Settings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="legacy_encrypted"
+    )
+    configuration.refresh_from_db()
+    unavailable = ProxboxPluginSettingsSerializer(
+        configuration,
+        data={"credential_storage_backend": "openbao"},
+        partial=True,
+    )
+    assert not unavailable.is_valid()
+    assert "credential_storage_backend" in unavailable.errors
+
+
+def test_endpoint_storage_serializer_create_update_and_patch_contract(
+    optionality_models,
+    settings,
+):
+    from netbox_proxbox.api.serializers.endpoints import ProxmoxEndpointSerializer
+
+    Settings, Endpoint = optionality_models
+    settings.PLUGINS = ["netbox_proxbox"]
+    configuration = Settings.get_solo()
+    configuration.credential_storage_backend = "legacy_encrypted"
+    configuration.encryption_key = Fernet.generate_key().decode("ascii")
+    configuration.save(update_fields=("credential_storage_backend", "encryption_key"))
+    create = ProxmoxEndpointSerializer(
+        data={
+            "name": "serializer-storage-create",
+            "domain": "create.example.test",
+            "mode": "undefined",
+            "enabled": False,
+            "credential_storage_backend": "legacy_encrypted",
+        }
+    )
+    assert create.is_valid(), create.errors
+    endpoint = create.save()
+    assert endpoint.credential_storage_backend == "legacy_encrypted"
+
+    update = ProxmoxEndpointSerializer(
+        endpoint,
+        data={
+            "name": endpoint.name,
+            "domain": endpoint.domain,
+            "mode": endpoint.mode,
+            "enabled": False,
+            "credential_storage_backend": "",
+        },
+    )
+    assert update.is_valid(), update.errors
+    endpoint = update.save()
+    assert endpoint.credential_storage_backend == ""
+
+    patch = ProxmoxEndpointSerializer(
+        endpoint,
+        data={"name": "serializer-storage-patched"},
+        partial=True,
+    )
+    assert patch.is_valid(), patch.errors
+    endpoint = patch.save()
+    assert endpoint.credential_storage_backend == ""
+
+    Endpoint.objects.filter(pk=endpoint.pk).update(credential_storage_backend="openbao")
+    endpoint.refresh_from_db()
+    unchanged = ProxmoxEndpointSerializer(
+        endpoint,
+        data={"credential_storage_backend": "openbao"},
+        partial=True,
+    )
+    assert unchanged.is_valid(), unchanged.errors
+    assert unchanged.save().credential_storage_backend == "openbao"
+
+    for forged in ("unknown-provider", "OPENBAO", None, 7):
+        serializer = ProxmoxEndpointSerializer(
+            endpoint,
+            data={"credential_storage_backend": forged},
+            partial=True,
+        )
+        assert not serializer.is_valid()
+        assert "credential_storage_backend" in serializer.errors
+
+    Endpoint.objects.filter(pk=endpoint.pk).update(
+        credential_storage_backend="legacy_encrypted"
+    )
+    endpoint.refresh_from_db()
+    unavailable = ProxmoxEndpointSerializer(
+        endpoint,
+        data={"credential_storage_backend": "openbao"},
+        partial=True,
+    )
+    assert not unavailable.is_valid()
+    assert "credential_storage_backend" in unavailable.errors
+
+
 @pytest.mark.parametrize("with_reference", [False, True])
 @pytest.mark.django_db(transaction=True)
 def test_0105_resets_only_unreferenced_implicit_openbao_default(
@@ -182,6 +404,150 @@ def test_0105_resets_only_unreferenced_implicit_openbao_default(
         ).credential_storage_backend == ("openbao" if endpoint is not None else "")
     finally:
         MigrationExecutor(connection).migrate(latest)
+
+
+@pytest.mark.django_db(
+    transaction=True,
+    databases=["default", "openbao_migration"],
+)
+def test_0105_checks_every_reference_on_nondefault_alias_and_replays(
+    pytestconfig,
+):
+    _require_harness(pytestconfig)
+    from importlib import import_module
+
+    from django.apps import apps
+    from django.db import connections
+    from netbox_proxbox.models import (
+        FastAPIEndpoint,
+        FirecrackerHost,
+        FirecrackerHostPool,
+        NodeSSHCredential,
+        PBSEndpoint,
+        PDMEndpoint,
+        ProxmoxEndpoint,
+        ProxmoxNode,
+        ProxboxPluginSettings,
+        ProxmoxVMCloudInit,
+    )
+    from virtualization.models import VirtualMachine
+
+    alias = "openbao_migration"
+    migration = import_module(
+        "netbox_proxbox.migrations.0105_reset_implicit_openbao_storage_default"
+    )
+    connections[alias].close()
+    connections[alias] = connections["default"].copy(alias=alias)
+    settings_row = ProxboxPluginSettings.objects.using(alias).create(
+        singleton_key="default",
+        credential_storage_backend="legacy_encrypted",
+    )
+    endpoint = ProxmoxEndpoint.objects.using(alias).create(
+        name="0105-all-fields-endpoint",
+        enabled=False,
+        credential_storage_backend="legacy_encrypted",
+    )
+    explicit_openbao = ProxmoxEndpoint.objects.using(alias).create(
+        name="0105-explicit-openbao",
+        enabled=False,
+        credential_storage_backend="openbao",
+    )
+    node = ProxmoxNode.objects.using(alias).create(
+        endpoint=endpoint,
+        name="0105-all-fields-node",
+        ip_address="127.0.0.1",
+    )
+    node_credential = NodeSSHCredential.objects.using(alias).create(
+        node=node,
+        username="migration-test",
+        known_host_fingerprint="SHA256:" + "A" * 43,
+    )
+    fastapi = FastAPIEndpoint.objects.using(alias).create(
+        name="0105-all-fields-fastapi",
+        domain="fastapi.example.test",
+        enabled=False,
+    )
+    pbs = PBSEndpoint.objects.using(alias).create(
+        name="0105-all-fields-pbs",
+        token_id="root@pam!migration",
+        enabled=False,
+    )
+    pdm = PDMEndpoint.objects.using(alias).create(
+        name="0105-all-fields-pdm",
+        token_id="root@pam!migration",
+        enabled=False,
+    )
+    pool = FirecrackerHostPool.objects.using(alias).create(
+        name="0105 pool",
+        slug="0105-pool",
+    )
+    firecracker = FirecrackerHost.objects.using(alias).create(
+        pool=pool,
+        name="0105-all-fields-firecracker",
+        agent_base_url="https://firecracker.example.test",
+    )
+    vm = VirtualMachine.objects.using(alias).create(
+        name="0105-all-fields-vm",
+        status="active",
+    )
+    cloud_init = ProxmoxVMCloudInit.objects.using(alias).create(virtual_machine=vm)
+    owners = {
+        "ProxmoxEndpoint": endpoint,
+        "NodeSSHCredential": node_credential,
+        "FastAPIEndpoint": fastapi,
+        "PBSEndpoint": pbs,
+        "PDMEndpoint": pdm,
+        "FirecrackerHost": firecracker,
+        "ProxmoxVMCloudInit": cloud_init,
+    }
+    schema_editor = SimpleNamespace(connection=connections[alias])
+
+    def raw_reference(owner, field_name: str, value: object) -> None:
+        field = owner._meta.get_field(field_name)
+        quote = connections[alias].ops.quote_name
+        with connections[alias].cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {quote(owner._meta.db_table)} "
+                f"SET {quote(field.column)} = %s WHERE id = %s",
+                [value, owner.pk],
+            )
+
+    original_overrides = {
+        endpoint.pk: endpoint.credential_storage_backend,
+        explicit_openbao.pk: explicit_openbao.credential_storage_backend,
+    }
+    for index, (model_name, fields) in enumerate(
+        migration.OPENBAO_REFERENCE_FIELDS.items(), start=1
+    ):
+        owner = owners[model_name]
+        for field_name in fields:
+            ProxboxPluginSettings.objects.using(alias).filter(
+                pk=settings_row.pk
+            ).update(credential_storage_backend="openbao")
+            reference = f"00000000-0000-4000-8000-{index:012d}"
+            raw_reference(owner, field_name, reference)
+
+            migration.reset_implicit_openbao_storage_default(apps, schema_editor)
+
+            settings_row.refresh_from_db(using=alias)
+            assert settings_row.credential_storage_backend == "openbao"
+            raw_reference(owner, field_name, None)
+            index += 1
+
+    migration.reset_implicit_openbao_storage_default(apps, schema_editor)
+    settings_row.refresh_from_db(using=alias)
+    assert settings_row.credential_storage_backend == ""
+    migration.reset_implicit_openbao_storage_default(apps, schema_editor)
+    settings_row.refresh_from_db(using=alias)
+    assert settings_row.credential_storage_backend == ""
+    assert (
+        dict(
+            ProxmoxEndpoint.objects.using(alias)
+            .filter(pk__in=original_overrides)
+            .values_list("pk", "credential_storage_backend")
+        )
+        == original_overrides
+    )
 
 
 @pytest.mark.parametrize("allow_writes", [False, True])
@@ -320,6 +686,25 @@ def test_w106_reports_unavailable_explicit_openbao(optionality_models, settings)
     configuration.save(update_fields=("credential_storage_backend",))
     ids = {warning.id for warning in insecure_transport_check(databases=["default"])}
     assert "netbox_proxbox.W106" in ids
+
+    configuration.credential_storage_backend = ""
+    configuration.save(update_fields=("credential_storage_backend",))
+    endpoint = Endpoint.objects.create(
+        name="endpoint-only-openbao",
+        enabled=False,
+        credential_storage_backend="openbao",
+    )
+    warnings = insecure_transport_check(databases=["default"])
+    w106 = [warning for warning in warnings if warning.id == "netbox_proxbox.W106"]
+    assert len(w106) == 1
+    assert "endpoint-only-openbao" in str(w106[0].msg)
+    assert "plugin settings" not in str(w106[0].msg)
+
+    settings.PLUGINS = ["netbox_proxbox", "netbox_openbao"]
+    ids = {warning.id for warning in insecure_transport_check(databases=["default"])}
+    assert "netbox_proxbox.W106" not in ids
+    settings.PLUGINS = ["netbox_proxbox"]
+    endpoint.delete()
 
 
 @pytest.mark.parametrize("saved", ["openbao", "legacy_encrypted"])
@@ -1258,6 +1643,440 @@ def test_settings_downgrade_refuses_inherited_endpoint_openbao_reference(
             configuration.save()
     configuration.refresh_from_db()
     assert configuration.credential_storage_backend == "openbao"
+
+
+def test_endpoint_inheritance_uses_explicit_global_legacy_selection(
+    optionality_models,
+    monkeypatch,
+):
+    from django.core.exceptions import ValidationError
+    from django.db import connection
+    from netbox_proxbox.integrations import openbao
+    from netbox_proxbox.models import NodeSSHCredential, ProxmoxNode
+
+    Settings, Endpoint = optionality_models
+    configuration = Settings.get_solo()
+    Settings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="legacy_encrypted"
+    )
+    endpoint = Endpoint.objects.create(
+        name="explicit-openbao-over-global-legacy",
+        enabled=False,
+        credential_storage_backend="openbao",
+    )
+    node = ProxmoxNode.objects.create(
+        endpoint=endpoint,
+        name="explicit-openbao-over-global-legacy-node",
+        ip_address="127.0.0.1",
+    )
+    owner = NodeSSHCredential.objects.create(
+        node=node,
+        username="storage-guard",
+        known_host_fingerprint="SHA256:" + "A" * 43,
+    )
+    table = connection.ops.quote_name(owner._meta.db_table)
+    column = connection.ops.quote_name("openbao_password_credential_uuid")
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"UPDATE {table} SET {column} = %s WHERE id = %s",
+            ["77777777-7777-4777-8777-777777777777", owner.pk],
+        )
+    monkeypatch.setattr(openbao, "is_netbox_openbao_installed", lambda: True)
+
+    with pytest.raises(ValidationError, match="cleanup path"):
+        Endpoint.objects.filter(pk=endpoint.pk).update(credential_storage_backend="")
+
+    endpoint.refresh_from_db()
+    owner.refresh_from_db()
+    assert endpoint.credential_storage_backend == "openbao"
+    assert owner.openbao_password_credential_uuid is not None
+
+
+@pytest.mark.django_db(
+    transaction=True,
+    databases=["default", "openbao_replica"],
+)
+def test_settings_update_locks_and_checks_the_write_router_database(
+    pytestconfig,
+):
+    _require_harness(pytestconfig)
+    from django.db import connections
+    from django.test import override_settings
+    from netbox_proxbox.models import ProxboxPluginSettings
+
+    alias = "openbao_replica"
+    connections[alias].close()
+    connections[alias] = connections["default"].copy(alias=alias)
+    configuration = ProxboxPluginSettings.get_solo()
+    ProxboxPluginSettings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="openbao"
+    )
+    observed = {"default": [], alias: []}
+
+    def capture(database):
+        def wrapper(execute, sql, params, many, context):
+            observed[database].append(sql)
+            return execute(sql, params, many, context)
+
+        return wrapper
+
+    with (
+        connections["default"].cursor() as cursor,
+        connections["default"].execute_wrapper(capture("default")),
+        connections[alias].execute_wrapper(capture(alias)),
+        override_settings(DATABASE_ROUTERS=[_PrimaryReplicaRouter()]),
+    ):
+        cursor.execute("SET lock_timeout TO '500ms'")
+        queryset = ProxboxPluginSettings.objects.filter(pk=configuration.pk)
+        assert queryset.db == alias
+        assert queryset.update(credential_storage_backend="legacy_encrypted") == 1
+        cursor.execute("SET lock_timeout TO DEFAULT")
+
+    default_sql = "\n".join(observed["default"]).upper()
+    assert "FOR UPDATE" in default_sql
+    assert "UPDATE" in default_sql
+    assert observed[alias] == []
+    configuration.refresh_from_db()
+    assert configuration.credential_storage_backend == "legacy_encrypted"
+
+
+@pytest.mark.django_db(
+    transaction=True,
+    databases=["default", "openbao_secondary"],
+)
+def test_settings_writes_do_not_scan_an_unrelated_primary_database(
+    pytestconfig,
+    request,
+):
+    _require_harness(pytestconfig)
+    from django.db import connection
+    from django.test import override_settings
+    from netbox_proxbox.models import (
+        NodeSSHCredential,
+        ProxmoxEndpoint,
+        ProxmoxNode,
+        ProxboxPluginSettings,
+    )
+
+    configuration = ProxboxPluginSettings.get_solo()
+    ProxboxPluginSettings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="openbao"
+    )
+    with _independent_secondary_database(request.node.nodeid) as alias:
+        endpoint = ProxmoxEndpoint.objects.create(
+            name="unrelated-primary-node-state",
+            enabled=False,
+            credential_storage_backend="",
+        )
+        node = ProxmoxNode.objects.create(
+            endpoint=endpoint,
+            name="unrelated-primary-node",
+            ip_address="127.0.0.1",
+        )
+        owner = NodeSSHCredential.objects.create(
+            node=node,
+            username="secondary-router-guard",
+            known_host_fingerprint="SHA256:" + "B" * 43,
+        )
+        table = connection.ops.quote_name(owner._meta.db_table)
+        column = connection.ops.quote_name("openbao_password_credential_uuid")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE {table} SET {column} = %s WHERE id = %s",
+                ["66666666-6666-4666-8666-666666666666", owner.pk],
+            )
+
+        with override_settings(DATABASE_ROUTERS=[_SecondaryWriteRouter()]):
+            for operation in ("save", "update", "bulk_update"):
+                ProxboxPluginSettings.objects.using(alias).filter(
+                    singleton_key="default"
+                ).update(credential_storage_backend="openbao")
+                current = ProxboxPluginSettings.objects.using(alias).get(
+                    singleton_key="default"
+                )
+                current.credential_storage_backend = "legacy_encrypted"
+                if operation == "save":
+                    current.save(update_fields=["credential_storage_backend"])
+                elif operation == "update":
+                    ProxboxPluginSettings.objects.filter(pk=current.pk).update(
+                        credential_storage_backend="legacy_encrypted"
+                    )
+                else:
+                    ProxboxPluginSettings.objects.bulk_update(
+                        [current], ["credential_storage_backend"]
+                    )
+                assert (
+                    ProxboxPluginSettings.objects.using(alias)
+                    .get(pk=current.pk)
+                    .credential_storage_backend
+                    == "legacy_encrypted"
+                )
+
+    configuration.refresh_from_db()
+    owner.refresh_from_db()
+    assert configuration.credential_storage_backend == "openbao"
+    assert owner.openbao_password_credential_uuid is not None
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("manager_name", ["default", "base"])
+def test_storage_conflict_upsert_is_rejected_during_first_reference(
+    optionality_models,
+    settings,
+    manager_name,
+):
+    from django.core.exceptions import ValidationError
+    from django.db import connections, transaction
+
+    Settings, Endpoint = optionality_models
+    settings.PLUGINS = ["netbox_proxbox"]
+    configuration = Settings.get_solo()
+    manager = Settings.objects if manager_name == "default" else Settings._base_manager
+    Settings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="openbao"
+    )
+    endpoint = Endpoint.objects.create(
+        name="conflict-upsert-first-reference",
+        enabled=False,
+        credential_storage_backend="",
+    )
+    reference_written = Event()
+    allow_reference_commit = Event()
+    upsert_finished = Event()
+    provider_errors: list[BaseException] = []
+    upsert_errors: list[BaseException] = []
+
+    def create_reference() -> None:
+        try:
+            connections["default"].close()
+            with transaction.atomic():
+                Settings.objects.select_for_update().get(pk=configuration.pk)
+                table = connections["default"].ops.quote_name(endpoint._meta.db_table)
+                column = connections["default"].ops.quote_name(
+                    "openbao_password_credential_uuid"
+                )
+                with connections["default"].cursor() as cursor:
+                    cursor.execute(
+                        f"UPDATE {table} SET {column} = %s WHERE id = %s",
+                        ["88888888-8888-4888-8888-888888888888", endpoint.pk],
+                    )
+                reference_written.set()
+                if not allow_reference_commit.wait(timeout=30):
+                    raise RuntimeError("timed out waiting to commit the reference")
+        except BaseException as exc:  # pragma: no cover - asserted in caller
+            provider_errors.append(exc)
+        finally:
+            connections["default"].close()
+
+    def conflict_upsert() -> None:
+        try:
+            connections["default"].close()
+            manager.bulk_create(
+                [
+                    Settings(
+                        singleton_key="default",
+                        credential_storage_backend="legacy_encrypted",
+                    )
+                ],
+                update_conflicts=True,
+                update_fields=["credential_storage_backend"],
+                unique_fields=["singleton_key"],
+            )
+        except BaseException as exc:  # pragma: no cover - asserted in caller
+            upsert_errors.append(exc)
+        finally:
+            upsert_finished.set()
+            connections["default"].close()
+
+    provider = Thread(target=create_reference, daemon=True)
+    provider.start()
+    assert reference_written.wait(timeout=30), provider_errors
+    upsert = Thread(target=conflict_upsert, daemon=True)
+    upsert.start()
+    assert upsert_finished.wait(timeout=10)
+    assert len(upsert_errors) == 1
+    assert isinstance(upsert_errors[0], ValidationError)
+    assert "Conflict upserts cannot change" in str(upsert_errors[0])
+    allow_reference_commit.set()
+    provider.join(timeout=30)
+    upsert.join(timeout=30)
+
+    assert not provider.is_alive()
+    assert not upsert.is_alive()
+    assert provider_errors == []
+    configuration.refresh_from_db()
+    endpoint.refresh_from_db()
+    assert configuration.credential_storage_backend == "openbao"
+    assert endpoint.openbao_password_credential_uuid is not None
+
+
+@pytest.mark.parametrize("operation", ["update", "bulk_update", "conflict_upsert"])
+def test_base_manager_settings_writes_refuse_existing_reference(
+    optionality_models,
+    settings,
+    operation,
+):
+    from django.core.exceptions import ValidationError
+
+    Settings, Endpoint = optionality_models
+    settings.PLUGINS = ["netbox_proxbox"]
+    configuration = Settings.get_solo()
+    Settings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="openbao"
+    )
+    Endpoint.objects.create(
+        name=f"base-manager-existing-reference-{operation}",
+        enabled=False,
+        credential_storage_backend="",
+        openbao_password_credential_uuid="55555555-5555-4555-8555-555555555555",
+    )
+    configuration.credential_storage_backend = "legacy_encrypted"
+
+    with pytest.raises(ValidationError):
+        if operation == "update":
+            Settings._base_manager.filter(pk=configuration.pk).update(
+                credential_storage_backend="legacy_encrypted"
+            )
+        elif operation == "bulk_update":
+            Settings._base_manager.bulk_update(
+                [configuration], ["credential_storage_backend"]
+            )
+        else:
+            Settings._base_manager.bulk_create(
+                [
+                    Settings(
+                        singleton_key="default",
+                        credential_storage_backend="legacy_encrypted",
+                    )
+                ],
+                update_conflicts=True,
+                update_fields=["credential_storage_backend"],
+                unique_fields=["singleton_key"],
+            )
+
+    configuration.refresh_from_db()
+    assert configuration.credential_storage_backend == "openbao"
+
+
+@pytest.mark.parametrize("manager_name", ["default", "base"])
+def test_validated_settings_bulk_update_persists_without_references(
+    optionality_models,
+    settings,
+    manager_name,
+):
+    Settings, _Endpoint = optionality_models
+    settings.PLUGINS = ["netbox_proxbox"]
+    configuration = Settings.get_solo()
+    configuration.credential_storage_backend = "legacy_encrypted"
+    manager = Settings.objects if manager_name == "default" else Settings._base_manager
+
+    assert manager.bulk_update([configuration], ["credential_storage_backend"]) == 1
+
+    configuration.refresh_from_db()
+    assert configuration.credential_storage_backend == "legacy_encrypted"
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("manager_name", "operation"),
+    [
+        ("default", "save"),
+        ("default", "update"),
+        ("default", "bulk_update"),
+        ("base", "update"),
+        ("base", "bulk_update"),
+    ],
+)
+def test_settings_downgrade_serializes_after_first_reference_without_companion(
+    optionality_models,
+    settings,
+    manager_name,
+    operation,
+):
+    from django.core.exceptions import ValidationError
+    from django.db import connections, transaction
+
+    Settings, Endpoint = optionality_models
+    settings.PLUGINS = ["netbox_proxbox"]
+    configuration = Settings.get_solo()
+    manager = Settings.objects if manager_name == "default" else Settings._base_manager
+    Settings.objects.filter(pk=configuration.pk).update(
+        credential_storage_backend="openbao"
+    )
+    endpoint = Endpoint.objects.create(
+        name="concurrent-inherited-reference",
+        enabled=False,
+        credential_storage_backend="",
+    )
+    reference_written = Event()
+    allow_reference_commit = Event()
+    downgrade_started = Event()
+    downgrade_finished = Event()
+    provider_errors: list[BaseException] = []
+    downgrade_errors: list[BaseException] = []
+
+    def create_reference_in_provider_lock_order() -> None:
+        try:
+            connections["default"].close()
+            with transaction.atomic():
+                Settings.objects.select_for_update().get(pk=configuration.pk)
+                table = connections["default"].ops.quote_name(endpoint._meta.db_table)
+                column = connections["default"].ops.quote_name(
+                    "openbao_password_credential_uuid"
+                )
+                with connections["default"].cursor() as cursor:
+                    cursor.execute(
+                        f"UPDATE {table} SET {column} = %s WHERE id = %s",
+                        ["99999999-9999-4999-8999-999999999999", endpoint.pk],
+                    )
+                reference_written.set()
+                if not allow_reference_commit.wait(timeout=30):
+                    raise RuntimeError("timed out waiting to commit the reference")
+        except BaseException as exc:  # pragma: no cover - asserted in caller
+            provider_errors.append(exc)
+        finally:
+            connections["default"].close()
+
+    def downgrade() -> None:
+        try:
+            connections["default"].close()
+            downgrade_started.set()
+            current = manager.get(pk=configuration.pk)
+            current.credential_storage_backend = "legacy_encrypted"
+            if operation == "save":
+                current.save(update_fields=["credential_storage_backend"])
+            elif operation == "update":
+                manager.filter(pk=current.pk).update(
+                    credential_storage_backend="legacy_encrypted"
+                )
+            else:
+                manager.bulk_update([current], ["credential_storage_backend"])
+        except BaseException as exc:  # pragma: no cover - asserted in caller
+            downgrade_errors.append(exc)
+        finally:
+            downgrade_finished.set()
+            connections["default"].close()
+
+    provider = Thread(target=create_reference_in_provider_lock_order, daemon=True)
+    provider.start()
+    assert reference_written.wait(timeout=30), provider_errors
+    downgrader = Thread(target=downgrade, daemon=True)
+    downgrader.start()
+    assert downgrade_started.wait(timeout=10)
+    assert not downgrade_finished.wait(timeout=0.25)
+    allow_reference_commit.set()
+    provider.join(timeout=30)
+    downgrader.join(timeout=30)
+
+    assert not provider.is_alive()
+    assert not downgrader.is_alive()
+    assert provider_errors == []
+    assert len(downgrade_errors) == 1
+    assert isinstance(downgrade_errors[0], ValidationError)
+    configuration.refresh_from_db()
+    endpoint.refresh_from_db()
+    assert configuration.credential_storage_backend == "openbao"
+    assert endpoint.openbao_password_credential_uuid is not None
 
 
 @pytest.mark.parametrize("disabled_package", [False, True])

@@ -179,6 +179,22 @@ guard primitives for its password/keypair pair. Selected OpenBao never resolves
 through the legacy `credential_reference_id`; explicit legacy mode preserves
 that opaque reference unchanged.
 
+All writes that can change
+`ProxboxPluginSettings.credential_storage_backend` must acquire the settings
+singleton row lock before their final provider-reference and assignment checks
+and retain it through persistence. Keep the provider transaction lock order:
+the settings singleton precedes every owner, assignment, and credential row.
+The order among those downstream rows varies by transaction family. Do not
+introduce a guard that locks any downstream row before the settings singleton.
+Material writers must revalidate the effective backend from that locked settings
+row and their locked owner graph before any provider or assignment write.
+Settings querysets must resolve and retain the write-router alias for the lock,
+final guards, and persistence; conflict upserts may not update the storage field.
+The supported endpoint delete removes its assignments before `pre_delete`;
+assignment-only state still present at that signal is an unsupported delete and
+must be refused. Supported cleanup also removes assignment-only state from an
+explicitly legacy endpoint while preserving assignments for other owners.
+
 - Inbound: forms, tables, filtersets, views, serializers, and migrations all rely on these model definitions.
 - Outbound: NetBox core model base classes plus related objects in `dcim`, `ipam`, `users`, and `virtualization`.
 
@@ -218,7 +234,12 @@ that opaque reference unchanged.
   `reuse_endpoint` mode derives `effective_ssh_username` from
   `username.split("@", 1)[0]` and treats the endpoint plaintext `password` as
   the SSH password; it still requires `ssh_host` and
-  `ssh_known_host_fingerprint`.
+  `ssh_known_host_fingerprint`. Model validation also accepts the endpoint
+  form's transient pending password candidate, without persisting it, so create
+  and password-rotation validation uses the same reuse rule as stored rows. Its
+  validation-only monitoring check accepts that candidate during the same save;
+  `service_monitoring_eligible` and runtime monitoring remain based only on
+  persisted credentials.
 - `ProxmoxEndpoint.service_monitoring_enabled` is gated by
   `service_monitoring_eligible`, which is true only when `allow_writes`,
   `ssh_access_enabled`, `has_ssh_terminal_credentials`, and
@@ -271,6 +292,11 @@ that opaque reference unchanged.
   Detail-page cards read only `obj.proxbox_sync_state` and remain absent when no
   sidecar exists. The surviving `proxmox_node` and `proxmox_storage` custom
   fields are live CREATE-placement inputs, not reflection fallbacks.
+- VM and device sidecars store proxbox-api's independent
+  `proxmox_endpoint_raw_id`. Device resolution filters it exactly together with
+  the cluster and node names; never replace it with a local endpoint primary
+  key. Legacy null device values remain valid until authoritative sync data is
+  available.
 - Concurrency known limitation: on NetBox 4.5.x, sync-state sidecar REST APIs
   do not emit ETags and do not enforce `If-Match`, matching the platform
   behavior for all endpoints on that release. Optimistic concurrency is

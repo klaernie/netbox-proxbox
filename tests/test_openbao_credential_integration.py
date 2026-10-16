@@ -145,6 +145,26 @@ def test_explicit_storage_selections_remain_authoritative(
     )
 
 
+def test_locked_storage_validation_uses_settings_and_endpoint_override(
+    monkeypatch,
+) -> None:
+    openbao = _load_openbao_module(monkeypatch)
+    monkeypatch.setattr(openbao, "is_netbox_openbao_installed", lambda: True)
+    locked = types.SimpleNamespace(credential_storage_backend=LEGACY)
+
+    with pytest.raises(openbao.ValidationError, match="storage conflict"):
+        openbao.validate_locked_openbao_storage(
+            locked,
+            conflict_message="storage conflict",
+        )
+
+    openbao.validate_locked_openbao_storage(
+        locked,
+        endpoint_override=OPENBAO,
+        conflict_message="storage conflict",
+    )
+
+
 SECRET_CASES = [
     ("resolve_endpoint_password", "openbao_password_credential_uuid", "password"),
     ("resolve_endpoint_token_value", "openbao_token_credential_uuid", "token"),

@@ -305,7 +305,8 @@ def test_settings_bulk_downgrade_refuses_remaining_single_secret_state(
         )
     settings = ProxboxPluginSettings.get_solo()
 
-    with pytest.raises(ValidationError, match="cleanup path"):
+    expected = "Conflict upserts" if operation == "upsert" else "cleanup path"
+    with pytest.raises(ValidationError, match=expected):
         if operation == "bulk_update":
             settings.credential_storage_backend = "legacy_encrypted"
             ProxboxPluginSettings.objects.bulk_update(
@@ -367,6 +368,48 @@ def test_legacy_to_openbao_waits_for_explicit_material_write(
     assert owner.openbao_token_credential_uuid is not None
     assert owner.token_secret_enc == ""
     assert owner.token_secret == "explicit-openbao-token"
+
+
+def test_single_secret_writer_revalidates_locked_storage_before_material(
+    openbao_single_estate,
+    monkeypatch,
+) -> None:
+    from django.core.exceptions import ValidationError
+    from netbox_openbao.models import Credential, CredentialAssignment
+    from netbox_proxbox.integrations import openbao_single_writer
+    from netbox_proxbox.models import ProxboxPluginSettings
+
+    actor, _policy, backend = openbao_single_estate
+    owner = _owner("pbs", actor)
+    _set_material(owner, "pbs", "must-not-write")
+    settings = ProxboxPluginSettings.get_solo()
+    credential_count = Credential.objects.count()
+    original_transaction = openbao_single_writer.single_secret_material_transaction
+
+    @contextmanager
+    def downgrade_then_enter(*args, **kwargs):
+        ProxboxPluginSettings.objects.filter(pk=settings.pk).update(
+            credential_storage_backend="legacy_encrypted"
+        )
+        with original_transaction(*args, **kwargs) as context:
+            yield context
+
+    monkeypatch.setattr(
+        openbao_single_writer,
+        "single_secret_material_transaction",
+        downgrade_then_enter,
+    )
+
+    with pytest.raises(ValidationError, match="storage selection changed"):
+        owner.save()
+
+    settings.refresh_from_db()
+    assert settings.credential_storage_backend == "legacy_encrypted"
+    assert owner.pk is None
+    assert owner.openbao_token_credential_uuid is None
+    assert Credential.objects.count() == credential_count
+    assert CredentialAssignment.objects.count() == 0
+    assert backend.store == {}
 
 
 def test_direct_reference_rebind_is_rejected_without_provider_change(
@@ -645,6 +688,23 @@ def test_raw_owner_writes_refuse_openbao_state(
             queryset.delete()
         else:
             queryset._raw_delete("default")
+
+
+def test_base_manager_owner_update_refuses_openbao_state(
+    openbao_single_estate,
+) -> None:
+    from django.core.exceptions import ValidationError
+
+    actor, _policy, _backend = openbao_single_estate
+    owner = _owner("pdm", actor)
+    _set_material(owner, "pdm", "base-manager-token")
+    owner.save()
+
+    with pytest.raises(ValidationError, match="cleanup path"):
+        type(owner)._base_manager.filter(pk=owner.pk).update(name="must-not-persist")
+
+    owner.refresh_from_db()
+    assert owner.name != "must-not-persist"
 
 
 def test_bulk_create_and_pool_cascade_refuse_openbao_state(

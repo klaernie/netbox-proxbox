@@ -16,6 +16,11 @@ already checked is never hidden, so you can always see and clear it. Hidden
 fields are still submitted unchanged, and the browser's own field checks are switched off while a section is hidden so a hidden field can never block saving. If JavaScript is unavailable, every
 section is shown.
 
+When reuse mode and service monitoring are enabled together, a password entered
+on the same create or edit submission satisfies validation without being copied
+onto the model as a validation side effect. Runtime readiness still becomes true
+only after the credential has been persisted successfully.
+
 ## API-only endpoints do not need SSH
 
 An endpoint with **API only** access never opens an SSH session. The form

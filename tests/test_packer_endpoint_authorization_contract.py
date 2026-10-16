@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from tests.operational_security_support import endpoint_authorizer
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,11 +71,31 @@ def _load_authorization_module(monkeypatch, *, backend_id: int = 701):
         None,
     )
     proxbox_access = ModuleType("netbox_proxbox.views.proxbox_access")
-    proxbox_access.permission_run_proxmox_action = lambda: "core.run_proxmox_action"
+    proxbox_access.user_can_run_endpoint_action = endpoint_authorizer(
+        permission="endpoint-action",
+    )
+    operational_target = ModuleType("netbox_proxbox.services.operational_target")
+
+    class OperationalTargetError(Exception):
+        pass
+
+    class OperationalTarget:
+        pass
+
+    operational_target.OperationalTarget = OperationalTarget
+    operational_target.OperationalTargetError = OperationalTargetError
+    operational_target.resolve_operational_target = lambda **kwargs: SimpleNamespace(
+        endpoint=kwargs["endpoint"],
+        backend_endpoint_id=backend_id,
+        context=SimpleNamespace(http_url="https://backend-a.example.test"),
+    )
     monkeypatch.setitem(
         sys.modules, "netbox_proxbox.services.backend_context", backend_context
     )
     monkeypatch.setitem(sys.modules, "netbox_proxbox.views.backend_sync", backend_sync)
+    monkeypatch.setitem(
+        sys.modules, "netbox_proxbox.services.operational_target", operational_target
+    )
     monkeypatch.setitem(
         sys.modules, "netbox_proxbox.views.proxbox_access", proxbox_access
     )
@@ -92,7 +114,7 @@ def _load_authorization_module(monkeypatch, *, backend_id: int = 701):
 @pytest.mark.parametrize(
     ("has_permission", "enabled", "allow_writes", "allow_narrow", "detail"),
     [
-        (False, True, True, True, "core.run_proxmox_action"),
+        (False, True, True, True, "run_proxmox_action"),
         (True, False, True, True, "disabled"),
         (True, True, False, True, "Proxmox-side writes"),
         (True, True, True, False, "explicitly allow"),
@@ -109,6 +131,7 @@ def test_template_build_authorization_truth_table_fails_closed(
     module = _load_authorization_module(monkeypatch)
     user = SimpleNamespace(has_perm=lambda permission: has_permission)
     endpoint = SimpleNamespace(
+        pk=7,
         enabled=enabled,
         allow_writes=allow_writes,
         allow_packer_template_builds=allow_narrow,
@@ -135,7 +158,9 @@ def test_template_build_uses_divergent_backend_identity_after_all_gates(
 
     module.require_template_build_authorization(user, endpoint)
 
-    assert module.resolve_authorized_backend_endpoint_id(endpoint) == 701
+    target = module.resolve_authorized_template_build_target(user, endpoint)
+    assert target.backend_endpoint_id == 701
+    assert target.context.http_url == "https://backend-a.example.test"
     assert endpoint.pk != 701
 
 
@@ -145,9 +170,11 @@ def test_rest_actions_gate_before_resolving_and_send_resolved_backend_id() -> No
         "def perform_destroy", 1
     )[0]
     assert helper.index("require_template_build_authorization") < helper.index(
-        "resolve_authorized_backend_endpoint_id"
+        "resolve_authorized_template_build_target"
     )
-    assert 'payload["endpoint_id"] = backend_endpoint_id' in helper
+    assert 'payload["endpoint_id"] = target.backend_endpoint_id' in helper
     for action_name in ("build_pve_template", "cloud_image_build_pipeline"):
         action = source.split(f"def {action_name}(", 1)[1].split("\n    @", 1)[0]
-        assert "self._template_build_payload(request, endpoint)" in action
+        assert "self._template_build_payload(" in action
+        assert "request, endpoint" in action
+        assert "context=target.context" in action

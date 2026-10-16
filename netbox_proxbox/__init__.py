@@ -161,6 +161,20 @@ def _runtime_dependencies_available() -> bool:
     )
 
 
+def _start_automatic_startup_push() -> None:
+    """Start discovery only for opted-in long-lived server and worker processes."""
+    from .background_tasks import automatic_background_tasks_enabled
+
+    if not automatic_background_tasks_enabled() or not _is_server_process():
+        return
+    thread = threading.Thread(
+        target=_deferred_startup_push,
+        daemon=True,
+        name="proxbox-startup-endpoint-push",
+    )
+    thread.start()
+
+
 class ProxboxConfig(PluginConfig):
     """Django app config for the Proxbox NetBox plugin (URLs, queues, job registration).
 
@@ -174,7 +188,7 @@ class ProxboxConfig(PluginConfig):
     name = "netbox_proxbox"
     verbose_name = "Proxbox"
     description = "Integrates Proxmox and Netbox"
-    version = "0.0.29.post4"
+    version = "0.0.29.post5"
     author = "Emerson Felipe (@emersonfelipesp)"
     author_email = "emersonfelipe.2003@gmail.com"
     # Sourced from .compat so the backward-compatible and GA contract is
@@ -184,11 +198,17 @@ class ProxboxConfig(PluginConfig):
     base_url = "proxbox"
     required_settings = []
     queues = []
+    default_settings = {"automatic_background_tasks": True}
 
     @classmethod
     def validate(cls, user_config: dict[str, object], netbox_version: str) -> None:
         """Apply the stock backward-compatible NetBox version bounds."""
         super().validate(user_config, netbox_version)
+        from .background_tasks import validate_automatic_background_tasks
+
+        validate_automatic_background_tasks(
+            user_config.get("automatic_background_tasks", True)
+        )
 
     def ready(self) -> None:
         """Register models, then import job modules so runners and core Job views hook in."""
@@ -248,18 +268,7 @@ class ProxboxConfig(PluginConfig):
         # after a fresh start or database wipe, without blocking Django initialization.
         # Only run for long-lived server processes — one-shot management commands
         # like ``createsuperuser`` must not have these warnings leak into stdout.
-        if _is_server_process():
-            thread = threading.Thread(
-                target=_deferred_startup_push,
-                daemon=True,
-                name="proxbox-startup-endpoint-push",
-            )
-            thread.start()
-        else:
-            logger.debug(
-                "Skipping proxbox startup push: not a server process (argv=%r)",
-                sys.argv,
-            )
+        _start_automatic_startup_push()
 
 
 config = ProxboxConfig

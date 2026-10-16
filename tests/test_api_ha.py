@@ -46,6 +46,16 @@ def test_ha_api_calls_expected_proxbox_endpoints() -> None:
     assert "translate_request_exception" in source
 
 
+def test_vm_ha_api_requires_visible_netbox_vm_and_scopes_one_endpoint() -> None:
+    source = HA_API_PATH.read_text(encoding="utf-8")
+    assert '_VM_ID_PARAMETER = "virtual_machine_id"' in source
+    assert 'VirtualMachine.objects.restrict(request.user, "view")' in source
+    assert "resolve_vm_endpoint_context(vm)" in source
+    assert "endpoint_ids=[endpoint_id]" in source
+    assert "OpenApiParameter" in source
+    assert "required=True" in source
+
+
 def test_ha_api_translates_upstream_404_to_503() -> None:
     """Match the user-facing copy used by the HTML views in views/ha.py."""
     source = HA_API_PATH.read_text(encoding="utf-8")

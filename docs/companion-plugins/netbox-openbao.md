@@ -125,6 +125,32 @@ not listed in `PLUGINS`; an endpoint that still holds references cannot be
 deleted, individually or through bulk deletion, until netbox-openbao is restored
 and the references are cleared.
 
+Storage changes through model `save()`, queryset `update()`, and `bulk_update()`
+lock the settings singleton before the final reference and assignment checks and
+retain that lock through persistence. OpenBao material transactions use the same
+common invariant without violating the provider boundary: enter the outer
+material transaction while the connection is in autocommit, then take the
+settings singleton as the first row lock inside the provider-owned durable
+transaction, before every owner, assignment, or credential row. Their
+downstream row order remains transaction-specific. This serializes the first
+provider reference against a concurrent global downgrade without introducing an
+inverse lock order or an application atomic block outside the provider.
+After acquiring that lock, every endpoint, node SSH, single-secret, and
+cloud-init material writer revalidates the effective backend from the locked
+settings and owner graph before any provider or assignment write. If a global
+downgrade committed first, the queued material write is refused without
+creating a credential, reference, or assignment. Queryset storage writes bind
+the lock, final state reads, and persistence to the write-router database;
+storage-changing conflict upserts are unsupported and must use `save()`,
+`update()`, or `bulk_update()` instead. These guards cover both default and base
+manager querysets. A literal `bulk_update()` is validated while holding the
+singleton lock, then a context-local internal permit allows only Django's
+generated `Case`/`Cast` persistence; caller-provided expressions remain
+refused. A blank endpoint override resolves against the effective global
+selection from the locked settings row on the same write database, so an
+explicitly OpenBao endpoint cannot inherit an explicit global legacy selection
+while references remain.
+
 Per-node SSH credentials used by hardware discovery and the node terminal use
 the same effective backend selection as their `ProxmoxEndpoint`. With OpenBao
 selected, Proxbox writes `ssh-password` and `ssh-keypair` material through the
@@ -201,6 +227,20 @@ or `ProxmoxEndpoint` is likewise refused while node references or assignments
 remain. Operators must first use the supported node-credential cleanup path;
 signal handlers never attempt provider cleanup from inside Django's deletion
 collector transaction.
+
+The supported `ProxmoxEndpoint.delete()` path removes endpoint assignments
+before Django emits `pre_delete`. Endpoints with OpenBao references retain the
+provider-owned cleanup transaction. An explicitly legacy endpoint with only
+generic assignments instead deletes those non-secret relation rows through the
+plain ORM in the current application transaction; this also works when NetBox's
+delete view has already opened an atomic block. The cleanup freshly resolves
+the request actor and verifies delete permission on every exact assignment
+before deleting any row; a denial preserves the endpoint and all assignments.
+No credential row or assignment targeting another owner is deleted. Therefore
+the signal also refuses an
+endpoint with assignment-only state: such state at `pre_delete` proves that a
+queryset, bulk, cascade, or other unsupported delete bypassed supported cleanup.
+The refusal leaves both the endpoint and assignments intact.
 
 The node credential metadata response exposes
 `openbao_assignment_ready`, `openbao_assignment_detail`, and the secret-free

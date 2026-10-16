@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import requests
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from virtualization.models import VirtualMachine
 
 from netbox_proxbox.services._endpoint_errors import translate_request_exception
 from netbox_proxbox.services.backend_context import get_fastapi_request_context
@@ -29,12 +30,96 @@ from netbox_proxbox.services.endpoint_scope import (
     enabled_backend_endpoint_scope,
     viewable_enabled_endpoint_ids,
 )
+from netbox_proxbox.vm_identity import resolve_vm_endpoint_context
 
 _BACKEND_NOT_CONFIGURED = "No FastAPI backend endpoint is configured."
 _BACKEND_TOO_OLD = (
     "Backend does not support HA endpoints — upgrade proxbox-api to v0.0.12 or later."
 )
 _HA_REQUEST_TIMEOUT = 15
+_VM_ID_PARAMETER = "virtual_machine_id"
+
+
+def _vm_endpoint_id(request: Request, vmid: int) -> int | Response:
+    """Resolve and authorize the endpoint for the requested NetBox VM."""
+    raw_vm_id = request.query_params.get(_VM_ID_PARAMETER)
+    if raw_vm_id in (None, ""):
+        return Response(
+            {
+                "detail": (
+                    "Query parameter 'virtual_machine_id' is required; pass the "
+                    "NetBox virtual machine primary key."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        vm_id = int(raw_vm_id)
+    except (TypeError, ValueError):
+        vm_id = 0
+    if vm_id < 1 or str(raw_vm_id).strip() != str(vm_id):
+        return Response(
+            {
+                "detail": "Query parameter 'virtual_machine_id' must be a positive integer."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        vm = (
+            VirtualMachine.objects.restrict(request.user, "view")
+            .select_related(
+                "proxbox_sync_state__endpoint",
+                "proxbox_sync_state__proxmox_cluster",
+                "proxbox_sync_state__proxmox_node",
+            )
+            .get(pk=vm_id)
+        )
+    except VirtualMachine.DoesNotExist:
+        return Response(
+            {
+                "detail": (
+                    "The requested virtual machine does not exist or is not visible "
+                    "to this user."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    resolved = resolve_vm_endpoint_context(vm)
+    if resolved is None:
+        return Response(
+            {
+                "detail": (
+                    "The requested virtual machine's synchronized Proxmox endpoint "
+                    "identity is missing, disabled, or inconsistent, or it has no "
+                    "synchronized Proxmox VM ID. Run a Proxbox sync and try again."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    endpoint_id, resolved_vmid, _vm_type = resolved
+    if resolved_vmid != vmid:
+        return Response(
+            {
+                "detail": (
+                    "The requested virtual machine's synchronized Proxmox VM ID "
+                    "does not match the path vmid."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if endpoint_id not in set(viewable_enabled_endpoint_ids(request.user)):
+        return Response(
+            {
+                "detail": (
+                    "The requested virtual machine's Proxmox endpoint is disabled "
+                    "or is not visible to this user."
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return endpoint_id
 
 
 def _proxy_get(
@@ -149,9 +234,24 @@ class HAVMResourceAPIView(APIView):
 
         return [_ProxboxDashboardPermission]
 
-    @extend_schema(responses={200: OpenApiTypes.OBJECT})
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name=_VM_ID_PARAMETER,
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="NetBox virtual machine primary key.",
+            )
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request: Request, vmid: int) -> Response:
         """Return the HA resource record for ``vmid`` or an empty object."""
+        endpoint_id = _vm_endpoint_id(request, vmid)
+        if isinstance(endpoint_id, Response):
+            return endpoint_id
+
         ctx = get_fastapi_request_context()
         if ctx is None or not ctx.http_url:
             return Response(
@@ -160,7 +260,7 @@ class HAVMResourceAPIView(APIView):
             )
 
         scope_params, _, scope_error = enabled_backend_endpoint_scope(
-            endpoint_ids=viewable_enabled_endpoint_ids(request.user),
+            endpoint_ids=[endpoint_id],
             base_url=ctx.http_url,
             auth_headers=ctx.headers or {},
             backend_verify_ssl=ctx.verify_ssl,
@@ -172,7 +272,15 @@ class HAVMResourceAPIView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
         if scope_params is None:
-            return Response({})
+            return Response(
+                {
+                    "detail": (
+                        "The requested virtual machine's Proxmox endpoint is no "
+                        "longer enabled or available."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         proxied = _proxy_get(
             f"{ctx.http_url}/proxmox/cluster/ha/resources/by-vm/{vmid}",

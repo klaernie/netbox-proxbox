@@ -6,7 +6,7 @@ from functools import wraps
 from typing import Any, Callable
 
 from django.core.exceptions import ValidationError
-from django.db import router
+from django.db import router, transaction
 from django.views.decorators.debug import sensitive_variables
 
 from .openbao_pending import SLOTS, PendingCredential, consume_credentials
@@ -42,9 +42,43 @@ def _database_alias(endpoint: Any, kwargs: dict[str, Any]) -> str:
     return kwargs.get("using") or router.db_for_write(type(endpoint), instance=endpoint)
 
 
+def _endpoint_assignment_rows(model: type, endpoint: Any, alias: str) -> Any:
+    return model.objects.using(alias).filter(
+        assigned_object_type__app_label=endpoint._meta.app_label,
+        assigned_object_type__model=endpoint._meta.model_name,
+        assigned_object_id=endpoint.pk,
+    )
+
+
+def _delete_legacy_assignment_only_endpoint(
+    endpoint: Any,
+    assignments: Any,
+    original: Callable,
+    args: tuple,
+    kwargs: dict[str, Any],
+    alias: str,
+) -> tuple[int, dict[str, int]]:
+    """Authorize and delete non-secret links without a provider transaction."""
+    from netbox.context import current_request
+
+    from .openbao_assignments import fresh_material_actor, _require_scope
+
+    with transaction.atomic(using=alias):
+        request = current_request.get()
+        request_user = getattr(request, "user", None)
+        actor = fresh_material_actor(
+            request_user or getattr(endpoint, "_openbao_actor_user", None)
+        )
+        locked = list(assignments.select_for_update().order_by("pk"))
+        for assignment in locked:
+            _require_scope(assignment, actor, "delete")
+        assignments.filter(pk__in=[assignment.pk for assignment in locked]).delete()
+        return original(*args, **kwargs)
+
+
 def _requires_owner(
     endpoint: Any,
-    pending: dict[str, PendingCredential],
+    pending: dict[str, PendingCredential] | bool,
     kwargs: dict[str, Any],
 ) -> bool:
     if pending:
@@ -118,6 +152,9 @@ _DELETE_WITHOUT_PROVIDER = (
     "is not installed and enabled. Restore netbox-openbao and clear the "
     "endpoint credentials before deleting the endpoint."
 )
+_STORAGE_CONFLICT = (
+    "The endpoint storage selection changed after material was supplied."
+)
 
 
 @sensitive_variables()
@@ -128,25 +165,31 @@ def delete_endpoint(
     kwargs: dict[str, Any],
 ) -> tuple[int, dict[str, int]]:
     """Unlink owned assignments and delete the endpoint in one transaction."""
-    from .openbao import endpoint_uses_openbao_storage, is_netbox_openbao_installed
+    from .openbao import is_netbox_openbao_installed
 
     references = {name: getattr(endpoint, name) for name in SLOTS}
+    has_references = any(references.values())
     if not is_netbox_openbao_installed():
-        if any(references.values()):
+        if has_references:
             raise ValidationError(_DELETE_WITHOUT_PROVIDER)
         return original(*args, **kwargs)
     from netbox_openbao.models import CredentialAssignment
+    from netbox_proxbox.choices import CredentialStorageBackendChoices
 
-    has_assignments = CredentialAssignment.objects.filter(
-        assigned_object_type__app_label=endpoint._meta.app_label,
-        assigned_object_type__model=endpoint._meta.model_name,
-        assigned_object_id=endpoint.pk,
-    ).exists()
-    if not endpoint_uses_openbao_storage(endpoint) or not (
-        any(references.values()) or has_assignments
-    ):
+    alias = _database_alias(endpoint, kwargs)
+    assignments = _endpoint_assignment_rows(CredentialAssignment, endpoint, alias)
+    has_assignments = assignments.exists()
+    if not (has_references or has_assignments):
         return original(*args, **kwargs)
-    if _database_alias(endpoint, kwargs) != "default":
+    if (
+        not has_references
+        and endpoint.credential_storage_backend
+        == CredentialStorageBackendChoices.LEGACY_ENCRYPTED
+    ):
+        return _delete_legacy_assignment_only_endpoint(
+            endpoint, assignments, original, args, kwargs, alias
+        )
+    if alias != "default":
         raise ValidationError(
             "OpenBao endpoint material requires the default database transaction owner."
         )
@@ -181,9 +224,7 @@ def save_endpoint(
     references = {name: getattr(endpoint, name) for name in SLOTS}
     if not endpoint_uses_openbao_storage(endpoint):
         if pending:
-            raise ValidationError(
-                "The endpoint storage selection changed after material was supplied."
-            )
+            raise ValidationError(_STORAGE_CONFLICT)
         return original(endpoint, *args, **kwargs)
     if (
         not _requires_owner(endpoint, pending, kwargs)
@@ -213,6 +254,7 @@ def _save_owned(
     args: tuple,
     kwargs: dict[str, Any],
 ) -> Any:
+    from .openbao import validate_locked_openbao_storage
     from .openbao_assignments import (
         apply_endpoint_material,
         reconcile_endpoint_assignments,
@@ -220,6 +262,21 @@ def _save_owned(
     )
 
     context.admit(endpoint)
+    locked = context.endpoints.get(endpoint.pk)
+    update_fields = kwargs.get("update_fields")
+    writes_override = update_fields is None or "credential_storage_backend" in {
+        str(field) for field in update_fields
+    }
+    endpoint_override = (
+        getattr(endpoint, "credential_storage_backend", "")
+        if locked is None or writes_override
+        else getattr(locked, "credential_storage_backend", "")
+    )
+    validate_locked_openbao_storage(
+        context.settings,
+        endpoint_override=endpoint_override,
+        conflict_message=_STORAGE_CONFLICT,
+    )
     _validate_reference_mutations(context, endpoint, pending)
     _validate_partial_assignment_state(context, endpoint, pending, kwargs)
     actor = resolve_transaction_actor(

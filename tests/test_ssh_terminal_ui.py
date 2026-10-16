@@ -139,7 +139,7 @@ def test_terminal_session_view_handles_store_and_one_shot() -> None:
     src = VIEW_PATH.read_text()
     # Credential modal payload + store flag are read from the request body.
     assert 'credential = body.get("credential")' in src
-    assert 'store = bool(body.get("store"))' in src
+    assert 'bool(body.get("store"))' in src
     # One-shot forwards inline creds to proxbox-api; store persists first.
     assert '"one_shot_credential"' in src
     assert "_apply_node_credential" in src
@@ -162,6 +162,8 @@ def test_terminal_session_view_preserves_security_gates() -> None:
     # the endpoint SSH access method explicitly, and store requires write perms +
     # an encryption key (503 when missing).
     assert "endpoint.ssh_access_enabled" in src
+    assert "endpoint_is_enabled(endpoint)" in src
+    assert '"Proxmox endpoint is disabled."' in src
     assert "status=403" in src
     assert "status=503" in src
     # A fingerprint is mandatory for both paths — enforced by the extracted,

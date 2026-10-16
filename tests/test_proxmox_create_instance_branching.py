@@ -106,8 +106,7 @@ def test_create_instance_rejects_enabled_isolation_without_active_branch(
     branch_lifecycle.require_active_branch_schema_id = require_active_branch
     endpoint = SimpleNamespace(pk=5, allow_writes=True)
     monkeypatch.setattr(module, "get_object_or_404", lambda *args, **kwargs: endpoint)
-    backend_context = pytest.fail
-    monkeypatch.setattr(module, "get_fastapi_request_context", backend_context)
+    monkeypatch.setattr(module, "resolve_operational_target", pytest.fail)
     monkeypatch.setattr(module.requests, "post", pytest.fail)
     request = SimpleNamespace(user=SimpleNamespace(username="operator"), body=b"{}")
 

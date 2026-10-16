@@ -203,6 +203,26 @@ def effective_credential_storage_backend(
     return CredentialStorageBackendChoices.LEGACY_ENCRYPTED
 
 
+def validate_locked_openbao_storage(
+    settings_row: Any,
+    *,
+    endpoint_override: str = "",
+    conflict_message: str,
+) -> None:
+    """Require OpenBao from state read after the settings singleton lock."""
+    backend = endpoint_override or (
+        getattr(settings_row, "credential_storage_backend", "") or ""
+    )
+    if not backend:
+        backend = (
+            CredentialStorageBackendChoices.OPENBAO
+            if is_netbox_openbao_installed()
+            else CredentialStorageBackendChoices.LEGACY_ENCRYPTED
+        )
+    if backend != CredentialStorageBackendChoices.OPENBAO:
+        raise ValidationError(conflict_message)
+
+
 def endpoint_uses_openbao_storage(endpoint: ProxmoxEndpoint) -> bool:
     return (
         effective_credential_storage_backend(endpoint)

@@ -2,15 +2,15 @@
 
 Trust boundary (operational-verbs.md §2.3):
 
-  Browser ─ POST ─▶ this view (gated by ``core.run_proxmox_action``)
+  Browser ─ POST ─▶ this view (gated by endpoint operational scope)
                   │
                   └─ HTTP POST ▶ proxbox-api ``/proxmox/{vm_type}/{vmid}/{verb}``
                                   (gated by ``ProxmoxEndpoint.allow_writes``)
 
 Each view:
 
-1. Requires ``core.run_proxmox_action`` via
-   ``ContentTypePermissionRequiredMixin`` (returns 403 otherwise).
+1. Requires ``run_proxmox_action`` on the VM's Proxmox endpoint, or the
+   deprecated literal ``core.run_proxmox_action`` compatibility permission.
 2. Resolves the VM's ``(endpoint_id, vmid, vm_type)`` triple. If any
    piece is missing, surfaces a Django message and redirects back to
    the VM detail page — never reaches proxbox-api.
@@ -35,11 +35,7 @@ from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
 from django.utils.translation import gettext_lazy as _
 from django.views import View
-from utilities.views import (
-    ContentTypePermissionRequiredMixin,
-    TokenConditionalLoginRequiredMixin,
-    register_model_view,
-)
+from utilities.views import TokenConditionalLoginRequiredMixin, register_model_view
 from virtualization.models import VirtualMachine
 
 from netbox_proxbox.services.backend_path import (
@@ -49,9 +45,22 @@ from netbox_proxbox.services.backend_path import (
 )
 from netbox_proxbox.models import ProxmoxNode
 from netbox_proxbox.services._endpoint_errors import translate_request_exception
-from netbox_proxbox.services.backend_context import get_fastapi_request_context
-from netbox_proxbox.vm_identity import resolve_vm_node, resolve_vm_type, resolve_vm_vmid
-from netbox_proxbox.views.proxbox_access import permission_run_proxmox_action
+from netbox_proxbox.services.operational_target import (
+    OperationalTargetError,
+    resolve_operational_target,
+)
+from netbox_proxbox.vm_identity import (
+    resolve_vm_endpoint_context,
+    resolve_vm_node,
+    resolve_vm_type,
+    resolve_vm_vmid,
+)
+from netbox_proxbox.views.proxbox_access import (
+    EndpointOperationalPermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    permission_run_proxmox_action,
+    user_can_run_endpoint_action,
+)
 
 __all__ = (
     "OperationalMigrateView",
@@ -64,37 +73,10 @@ __all__ = (
 _BACKEND_TIMEOUT_S = 30
 
 
-def resolve_vm_endpoint_context(
-    vm: VirtualMachine,
-) -> tuple[int, int, str] | None:
-    """Return ``(endpoint_id, vmid, vm_type)`` if the VM is fully addressable.
-
-    Returns ``None`` when any piece is missing — the caller should hide
-    the button or surface a message rather than POSTing an invalid call
-    to proxbox-api.
-    """
-    cluster = getattr(vm, "cluster", None)
-    if cluster is None:
-        return None
-    proxmox_cluster = cluster.proxmox_cluster_tracking.first()
-    if proxmox_cluster is None or proxmox_cluster.endpoint_id is None:
-        return None
-    endpoint = getattr(proxmox_cluster, "endpoint", None)
-    if endpoint is not None and not bool(getattr(endpoint, "enabled", True)):
-        return None
-    try:
-        raw_vmid = resolve_vm_vmid(vm)
-        vmid = int(raw_vmid) if raw_vmid else None
-    except (TypeError, ValueError):
-        return None
-    if vmid is None:
-        return None
-    return (int(proxmox_cluster.endpoint_id), vmid, resolve_vm_type(vm))
-
-
 class _OperationalVerbView(
     TokenConditionalLoginRequiredMixin,
-    ContentTypePermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    EndpointOperationalPermissionRequiredMixin,
     View,
 ):
     """Shared dispatch path for the four operational verbs."""
@@ -102,16 +84,9 @@ class _OperationalVerbView(
     verb: ClassVar[str] = ""
     http_method_names: ClassVar[list[str]] = ["post"]
 
-    def get_required_permission(self) -> str:
-        """Return the run_proxmox_action permission codename."""
-        return permission_run_proxmox_action()
-
     def post(self, request: HttpRequest, pk: int | str) -> HttpResponseRedirect:
         """Forward a verb invocation to proxbox-api."""
-        vm = get_object_or_404(
-            VirtualMachine.objects.restrict(request.user, "view"),
-            pk=pk,
-        )
+        vm = _operational_vm_or_404(request, pk)
         return _forward_verb(request, vm, self.verb, extra_body=None)
 
 
@@ -147,7 +122,8 @@ class OperationalSnapshotView(_OperationalVerbView):
 )
 class OperationalMigrateView(
     TokenConditionalLoginRequiredMixin,
-    ContentTypePermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    EndpointOperationalPermissionRequiredMixin,
     View,
 ):
     """GET: render target-node picker. POST: dispatch the ``migrate`` verb.
@@ -159,16 +135,9 @@ class OperationalMigrateView(
 
     http_method_names: ClassVar[list[str]] = ["get", "post"]
 
-    def get_required_permission(self) -> str:
-        """Return the run_proxmox_action permission codename."""
-        return permission_run_proxmox_action()
-
     def get(self, request: HttpRequest, pk: int | str) -> HttpResponse:
         """Render the target-node picker for the migrate verb."""
-        vm = get_object_or_404(
-            VirtualMachine.objects.restrict(request.user, "view"),
-            pk=pk,
-        )
+        vm = _operational_vm_or_404(request, pk)
         ctx = resolve_vm_endpoint_context(vm)
         targets: list[ProxmoxNode] = []
         current_node = ""
@@ -195,10 +164,7 @@ class OperationalMigrateView(
 
     def post(self, request: HttpRequest, pk: int | str) -> HttpResponseRedirect:
         """Forward migrate dispatch with the chosen target node."""
-        vm = get_object_or_404(
-            VirtualMachine.objects.restrict(request.user, "view"),
-            pk=pk,
-        )
+        vm = _operational_vm_or_404(request, pk)
         target = (request.POST.get("target") or "").strip()
         if not target:
             messages.error(
@@ -214,6 +180,26 @@ class OperationalMigrateView(
             "migrate",
             extra_body={"target": target, "online": online},
         )
+
+
+def _operational_vm_or_404(request: HttpRequest, pk: int | str) -> VirtualMachine:
+    """Return a visible VM only when its endpoint is in operational scope."""
+    vm = get_object_or_404(
+        VirtualMachine.objects.restrict(request.user, "view"),
+        pk=pk,
+    )
+    resolved = resolve_vm_endpoint_context(vm)
+    has_perm = getattr(request.user, "has_perm", None)
+    if (
+        resolved is None
+        and callable(has_perm)
+        and has_perm(permission_run_proxmox_action())
+    ):
+        return vm
+    endpoint_id = resolved[0] if resolved is not None else None
+    if user_can_run_endpoint_action(request.user, endpoint_id):
+        return vm
+    return get_object_or_404(VirtualMachine.objects.none(), pk=pk)
 
 
 def _current_node_name(vm: VirtualMachine) -> str:
@@ -243,13 +229,9 @@ def _forward_verb(
         return HttpResponseRedirect(redirect_to)
     endpoint_id, vmid, vm_type = resolved
 
-    ctx = get_fastapi_request_context()
-    if ctx is None or not ctx.http_url:
-        messages.error(request, _("No FastAPI backend endpoint is configured."))
-        return HttpResponseRedirect(redirect_to)
-
     try:
-        url = f"{ctx.http_url}/proxmox/{safe_vm_type(vm_type)}/{safe_vmid(vmid)}/{verb}"
+        vm_type_segment = safe_vm_type(vm_type)
+        vmid_segment = safe_vmid(vmid)
     except UnsafeBackendPathSegment:
         messages.error(
             request,
@@ -259,6 +241,25 @@ def _forward_verb(
             ),
         )
         return HttpResponseRedirect(redirect_to)
+    sync_state = getattr(vm, "proxbox_sync_state", None)
+    endpoint = getattr(sync_state, "endpoint", None)
+    if endpoint is None or getattr(endpoint, "pk", None) != endpoint_id:
+        messages.error(
+            request, _("The VM's Proxmox endpoint identity is inconsistent.")
+        )
+        return HttpResponseRedirect(redirect_to)
+    try:
+        target = resolve_operational_target(
+            endpoint=endpoint,
+            user=request.user,
+            timeout=_BACKEND_TIMEOUT_S,
+        )
+    except OperationalTargetError as exc:
+        messages.error(request, _(exc.detail))
+        return HttpResponseRedirect(redirect_to)
+
+    ctx = target.context
+    url = f"{ctx.http_url}/proxmox/{vm_type_segment}/{vmid_segment}/{verb}"
     headers = dict(ctx.headers or {})
     headers["Idempotency-Key"] = str(uuid.uuid4())
     headers.setdefault("Content-Type", "application/json")
@@ -266,7 +267,7 @@ def _forward_verb(
     try:
         response = requests.post(
             url,
-            params={"endpoint_id": endpoint_id},
+            params={"endpoint_id": target.backend_endpoint_id},
             json=extra_body or {},
             headers=headers,
             timeout=_BACKEND_TIMEOUT_S,

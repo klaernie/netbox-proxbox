@@ -168,13 +168,23 @@ separate permission contracts.
 Proxmox and remote NetBox endpoint edits are configuration drafts until their
 exact connection target has been approved. The internal
 `approved_connection_target_fingerprint` binds the domain, fallback IP value,
-port, TLS policy, and authentication identity. Display-name changes do not
+port, TLS policy, and authentication identity. For a remote NetBox endpoint,
+the identity includes the effective token version and either the selected v1
+token record ID or the effective v2 key. The v2 selector uses the explicit
+`token_key`, falling back to a linked v2 token's key when the explicit field is
+blank; the same selector builds the backend payload. The token secret is never
+read, displayed, or hashed for target approval. Display-name changes do not
 invalidate it. Target edits, approval revocation, changed IPAddress values, and
 stale loaded endpoint objects block credential payload creation before secret
 resolution. Approval is checked again after material resolution and before a
 backend write, including when it changes during the backend listing request.
 
 Migration `0104_security_hardening` leaves existing approvals blank.
+Migration `0106_device_sync_scope_and_netbox_token_approval` clears every
+existing remote NetBox endpoint approval because older fingerprints did not
+bind the selected token identity. It does not alter Proxmox endpoint approvals
+and never approves a target automatically. After upgrading, review and approve
+each configured remote NetBox endpoint before resuming synchronization.
 The endpoint detail page provides a **Connection target approval** panel. Review
 every displayed destination, fallback IP address, port, TLS policy, and
 authentication identity before selecting **Approve reviewed target**. Approval
@@ -195,7 +205,8 @@ After upgrading, review each intended endpoint before resuming synchronization:
 1. Read `GET /api/plugins/proxbox/endpoints/proxmox/{id}/connection-authority/`
    or `GET /api/plugins/proxbox/endpoints/netbox/{id}/connection-authority/`.
    The response contains only the target, its fingerprint, and approval state.
-2. Review the exact target, including its fallback IP and TLS policy.
+2. Review the exact target, including its fallback IP, TLS policy, and the
+   remote NetBox token identity when present. The secret is never returned.
 3. Submit `PUT` to the same URL with
    `{"target_fingerprint": "<the reviewed fingerprint>"}`.
    Approval requires sensitive-data access and independent view/change access

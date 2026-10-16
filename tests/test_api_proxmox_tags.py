@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.operational_security_support import endpoint_authorizer
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROXMOX_TAGS_API = REPO_ROOT / "netbox_proxbox" / "api" / "proxmox_tags.py"
 BACKEND_PATH_MODULE = REPO_ROOT / "netbox_proxbox" / "services" / "backend_path.py"
@@ -49,12 +51,42 @@ def _load(monkeypatch: pytest.MonkeyPatch):
     backend_context_mod = types.ModuleType("netbox_proxbox.services.backend_context")
     backend_context_mod.get_fastapi_request_context = lambda endpoint_id=None: None
 
+    operational_target_mod = types.ModuleType(
+        "netbox_proxbox.services.operational_target"
+    )
+
+    class OperationalTargetError(Exception):
+        pass
+
+    operational_target_mod.OperationalTargetError = OperationalTargetError
+    operational_target_mod.resolve_operational_target = lambda **kwargs: (
+        SimpleNamespace(
+            endpoint=kwargs["endpoint"],
+            backend_endpoint_id=701,
+            context=SimpleNamespace(
+                http_url="https://backend.example.com:8800",
+                headers={"X-Proxbox-API-Key": "secret"},
+                verify_ssl=False,
+            ),
+        )
+    )
+
     operational_mod = types.ModuleType("netbox_proxbox.views.operational")
     operational_mod.resolve_vm_endpoint_context = lambda vm: (7, 100, "qemu")
     operational_mod._current_node_name = lambda vm: "pve1"
 
     proxbox_access_mod = types.ModuleType("netbox_proxbox.views.proxbox_access")
-    proxbox_access_mod.permission_run_proxmox_action = lambda: "core.run_proxmox_action"
+    proxbox_access_mod.user_can_run_endpoint_action = endpoint_authorizer()
+
+    operational_permissions_mod = types.ModuleType(
+        "netbox_proxbox.api.operational_permissions"
+    )
+    operational_permissions_mod.EndpointOperationalActionPermission = type(
+        "EndpointOperationalActionPermission", (), {}
+    )
+    operational_permissions_mod.TokenWriteScopePermission = type(
+        "TokenWriteScopePermission", (), {}
+    )
 
     utils_mod = types.ModuleType("netbox_proxbox.utils")
     utils_mod.resolve_vm_type = lambda vm: "qemu"
@@ -105,9 +137,11 @@ def _load(monkeypatch: pytest.MonkeyPatch):
         "requests.exceptions": requests_exceptions,
         "netbox_proxbox.services._endpoint_errors": endpoint_errors_mod,
         "netbox_proxbox.services.backend_context": backend_context_mod,
+        "netbox_proxbox.services.operational_target": operational_target_mod,
         "netbox_proxbox.services.backend_path": _load_backend_path_module(),
         "netbox_proxbox.views.operational": operational_mod,
         "netbox_proxbox.views.proxbox_access": proxbox_access_mod,
+        "netbox_proxbox.api.operational_permissions": operational_permissions_mod,
         "netbox_proxbox.utils": utils_mod,
         "rest_framework": rf,
         "rest_framework.status": rf_status,
@@ -132,8 +166,13 @@ def _load(monkeypatch: pytest.MonkeyPatch):
 
 
 def _make_vm(*, pk=42):
+    endpoint = SimpleNamespace(pk=7, enabled=True)
     return SimpleNamespace(
-        pk=pk, cluster=SimpleNamespace(), device=None, custom_field_data={}
+        pk=pk,
+        cluster=SimpleNamespace(),
+        device=None,
+        custom_field_data={},
+        proxbox_sync_state=SimpleNamespace(endpoint=endpoint),
     )
 
 
@@ -196,16 +235,6 @@ def test_put_forwards_replace_payload(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr(module.requests, "request", fake_request)
-    monkeypatch.setattr(
-        module,
-        "get_fastapi_request_context",
-        lambda endpoint_id=None: SimpleNamespace(
-            http_url="https://backend.example.com:8800",
-            headers={"X-Proxbox-API-Key": "secret"},
-            verify_ssl=False,
-        ),
-    )
-
     response = module.VirtualMachineProxmoxTagsAPIView().put(
         _request(data={"tags": ["alpha"]}),
         pk=vm.pk,
@@ -214,9 +243,10 @@ def test_put_forwards_replace_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     assert response.status_code == 200
     assert captured["method"] == "PUT"
     assert captured["url"] == "https://backend.example.com:8800/proxmox/qemu/100/tags"
-    assert captured["params"] == {"endpoint_id": 7}
+    assert captured["params"] == {"endpoint_id": 701}
     assert captured["json"] == {"node": "pve1", "tags": ["alpha"]}
     assert captured["headers"]["X-Proxbox-Actor"] == "alice"
+    assert response.data["endpoint_id"] == 701
 
 
 def test_patch_rejects_missing_add_and_remove(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -272,12 +302,8 @@ def test_invalid_identifiers_are_rejected_without_backend_call(
     )
     monkeypatch.setattr(
         module,
-        "get_fastapi_request_context",
-        lambda endpoint_id=None: SimpleNamespace(
-            http_url="https://backend.example.com:8800",
-            headers={},
-            verify_ssl=True,
-        ),
+        "resolve_operational_target",
+        lambda **_kwargs: pytest.fail("target resolution must not run"),
     )
 
     response = module.VirtualMachineProxmoxTagsAPIView().put(

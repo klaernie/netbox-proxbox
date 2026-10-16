@@ -441,6 +441,17 @@ fake historical models for both generations.
   The published 0.0.29 candidates froze 0104, so 0105 starts the next
   release boundary.
 
+- Migration `0106_device_sync_scope_and_netbox_token_approval` is the single
+  migration for the next release unit. It adds the device-sidecar
+  `proxmox_endpoint_raw_id` with `add_field_idempotent` and deliberately leaves
+  every existing device row null. Historical VM IDs cannot prove current
+  backend ownership after restore, reseed, or ID reuse; reconciliation stamps
+  the current ID later. The forward data step clears existing remote NetBox
+  endpoint approvals so
+  operators explicitly approve the new token-bound fingerprint. Proxmox
+  approvals are not changed, and reverse data migration is intentionally a
+  no-op.
+
 ## Links
 
 - Parent: [`../CLAUDE.md`](../CLAUDE.md)

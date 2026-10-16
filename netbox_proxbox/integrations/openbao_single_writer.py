@@ -524,6 +524,7 @@ def save_single_secret_owner(
         ) as context:
             context.admit(owner)
             context.declare_intent(owner, intent)
+            context.validate_openbao_storage()
             previous = _previous_owner(context, owner)
             if previous is not None:
                 _validate_reference(owner, previous, intent is not None)

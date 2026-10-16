@@ -251,11 +251,14 @@ only optionally links to a NetBox core cluster. It is not a one-to-one extension
 of `virtualization.Cluster`.
 
 Legacy backend IDs are preserved as raw data rather than guessed as plugin
-primary keys. The VM sidecar stores legacy `proxmox_endpoint_id` in
-`proxmox_endpoint_raw_id`; the cluster sidecar stores legacy
+primary keys. The VM and device sidecars store proxbox-api's independent
+`proxmox_endpoint_id` in `proxmox_endpoint_raw_id`; the cluster sidecar stores legacy
 `proxmox_cluster_id` in `proxmox_cluster_raw_id`. FK resolution uses strong
 NetBox relationships first and otherwise requires an endpoint-scoped unique
-name match.
+name match. Migration 0106 adds the nullable device field but leaves all
+existing values null. Historical VM raw IDs cannot prove current backend
+ownership after backend restore, reseed, or ID reuse; the active backend stamps
+its current ID when reconciliation adopts or creates the device sidecar.
 
 The two object-valued legacy custom fields are stored as real relations rather
 than opaque JSON through a retry-safe split migration sequence. Migration `0067`

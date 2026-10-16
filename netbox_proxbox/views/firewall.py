@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from django.contrib import messages
-from django.http import HttpRequest, HttpResponseRedirect
+from django.http import Http404, HttpRequest, HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django.views import View
@@ -24,18 +24,20 @@ from netbox.views.generic import (
     ObjectListView,
     ObjectView,
 )
-from utilities.views import (
-    ContentTypePermissionRequiredMixin,
-    TokenConditionalLoginRequiredMixin,
-    register_model_view,
-)
+from utilities.views import TokenConditionalLoginRequiredMixin, register_model_view
 
 from netbox_proxbox import filtersets, forms, models, tables
 from netbox_proxbox.intent.firewall_common import (
     FirewallPushError,
     push_firewall_object,
+    resolve_firewall_endpoint,
 )
-from netbox_proxbox.views.proxbox_access import permission_run_proxmox_action
+from netbox_proxbox.services.endpoint_enabled import endpoint_is_enabled
+from netbox_proxbox.views.proxbox_access import (
+    EndpointOperationalPermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    user_can_run_endpoint_action,
+)
 
 _SG_QS = models.ProxmoxFirewallSecurityGroup.objects.select_related("endpoint")
 _RULE_QS = models.ProxmoxFirewallRule.objects.select_related(
@@ -55,7 +57,8 @@ _OPTIONS_QS = models.ProxmoxFirewallOptions.objects.select_related(
 
 class _FirewallPushView(
     TokenConditionalLoginRequiredMixin,
-    ContentTypePermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    EndpointOperationalPermissionRequiredMixin,
     View,
 ):
     """Shared detail action for pushing a firewall object to Proxmox."""
@@ -64,10 +67,6 @@ class _FirewallPushView(
     queryset: ClassVar[object]
     http_method_names: ClassVar[list[str]] = ["post"]
 
-    def get_required_permission(self) -> str:
-        """Require the Proxmox write permission for every firewall push."""
-        return permission_run_proxmox_action()
-
     def post(self, request: HttpRequest, pk: int | str) -> HttpResponseRedirect:
         """Forward the push to proxbox-api and redirect back to the object."""
         qs = self.queryset
@@ -75,10 +74,12 @@ class _FirewallPushView(
         if callable(restrict):
             qs = restrict(request.user, "change")
         obj = get_object_or_404(qs, pk=pk)
+        if not _firewall_action_allowed(request.user, obj):
+            raise Http404
         redirect_to = obj.get_absolute_url()
         actor = _actor_from_request(request)
         try:
-            result = push_firewall_object(obj, actor=actor)
+            result = push_firewall_object(obj, actor=actor, user=request.user)
         except FirewallPushError as exc:
             messages.error(
                 request,
@@ -114,18 +115,15 @@ class FirewallBulkPushAction(ObjectAction):
 
 class ProxmoxFirewallRuleBulkPushView(
     TokenConditionalLoginRequiredMixin,
-    ContentTypePermissionRequiredMixin,
+    TokenWriteScopeRequiredMixin,
+    EndpointOperationalPermissionRequiredMixin,
     View,
 ):
     """Push selected firewall rules and summarize per-record results."""
 
     http_method_names: ClassVar[list[str]] = ["post"]
 
-    def get_required_permission(self) -> str:
-        """Require the Proxmox write permission for bulk firewall push."""
-        return permission_run_proxmox_action()
-
-    def post(self, request: HttpRequest) -> HttpResponseRedirect:
+    def post(self, request: HttpRequest) -> HttpResponse:
         """Push selected firewall rules and redirect back to the list."""
         selected_ids = request.POST.getlist("pk") or request.POST.getlist("pk[]")
         redirect_to = request.POST.get("return_url") or request.META.get(
@@ -140,9 +138,15 @@ class ProxmoxFirewallRuleBulkPushView(
         success_count = 0
         failures: list[str] = []
         queryset = _RULE_QS.restrict(request.user, "change")
-        for rule in queryset.filter(pk__in=selected_ids):
+        rules = list(queryset.filter(pk__in=selected_ids))
+        if any(not _firewall_action_allowed(request.user, rule) for rule in rules):
+            return HttpResponse(
+                "Proxmox endpoint is outside the operational permission scope.",
+                status=403,
+            )
+        for rule in rules:
             try:
-                push_firewall_object(rule, actor=actor)
+                push_firewall_object(rule, actor=actor, user=request.user)
                 success_count += 1
             except FirewallPushError as exc:
                 failures.append(f"#{rule.pk}: {exc.reason}")
@@ -162,6 +166,16 @@ class ProxmoxFirewallRuleBulkPushView(
                 ),
             )
         return HttpResponseRedirect(redirect_to)
+
+
+def _firewall_action_allowed(user: object, obj: object) -> bool:
+    """Return whether the firewall object's owning endpoint is authorized."""
+    endpoint = resolve_firewall_endpoint(obj)
+    return bool(
+        endpoint is not None
+        and endpoint_is_enabled(endpoint)
+        and user_can_run_endpoint_action(user, getattr(endpoint, "pk", None))
+    )
 
 
 def _actor_from_request(request: HttpRequest) -> str:

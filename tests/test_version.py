@@ -104,16 +104,16 @@ CERTIFICATION_PATH = REPO_ROOT / "CERTIFICATION.md"
 DOCS_CERTIFICATION_PATH = REPO_ROOT / "docs" / "certification.md"
 APPLICATION_PACKET_PATH = REPO_ROOT / "docs" / "application-packet.md"
 
-CURRENT_PLUGIN_VERSION = "0.0.29.post4"
-CURRENT_RELEASE_VERSION = "0.0.29.post4"
-CURRENT_PACKAGE_VERSION = "0.0.29.post4"
-CURRENT_PROXBOX_API_PAIRING_LABEL = "v0.0.23.post3"
+CURRENT_PLUGIN_VERSION = "0.0.29.post5"
+CURRENT_RELEASE_VERSION = "0.0.29.post5"
+CURRENT_PACKAGE_VERSION = "0.0.29.post5"
+CURRENT_PROXBOX_API_PAIRING_LABEL = "v0.0.27.post3"
 CURRENT_PAIRING_LINE = (
-    "Current backend-runtime pairing: netbox-proxbox 0.0.29.post4 <-> proxbox-api "
-    "0.0.23.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST "
+    "Current backend-runtime pairing: netbox-proxbox 0.0.29.post5 <-> proxbox-api "
+    "0.0.27.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST "
     "dependency only and does not provide the semantic MCP bridge."
 )
-PROXBOX_API_WORKFLOW_DEFAULT_VERSION = "0.0.23.post3"
+PROXBOX_API_WORKFLOW_DEFAULT_VERSION = "0.0.27.post3"
 CURRENT_NETBOX_MIN_VERSION = "4.5.8"
 # Ceiling of the backward-compatible stable tier: the whole NetBox 4.7 series.
 CURRENT_NETBOX_STABLE_MAX_VERSION = "4.7.99"
@@ -280,7 +280,7 @@ PREVIOUS_PLUGIN_VERSION = "0.0.22"
 PREVIOUS_PROXBOX_API_VERSION = "0.0.19.post5"
 RELEASE_NOTES_029_PATH = REPO_ROOT / "docs" / "release-notes" / "version-0.0.29.md"
 CURRENT_RELEASE_NOTES_PATH = (
-    REPO_ROOT / "docs" / "release-notes" / "version-0.0.29.post4.md"
+    REPO_ROOT / "docs" / "release-notes" / "version-0.0.29.post5.md"
 )
 
 
@@ -1229,7 +1229,7 @@ def _assert_release_workflow_e2e_counts(publish_workflow: str) -> None:
 def test_release_workflow_uses_matching_package_indexes_for_e2e() -> None:
     # The release workflow pairs each E2E gate with the same package index the
     # plugin is being validated against: the TestPyPI plugin candidate uses the
-    # stable proxbox-api from PyPI because proxbox-api 0.0.23.post3 is not published
+    # stable proxbox-api from PyPI because proxbox-api 0.0.27.post3 is not published
     # on TestPyPI. PyPI candidate and final gates use that same PyPI source.
     # `dependency_mode: dev` clones
     # proxbox-api main HEAD and must not appear here — main may sit on a
@@ -1327,7 +1327,7 @@ def test_e2e_workflow_supports_proxbox_api_package_index_runtime_modes():
     assert '"${PROXBOX_API_PACKAGE_SPEC}"' in e2e_workflow
 
 
-def test_current_release_pairing_is_documented_in_primary_docs():
+def test_current_source_pairing_is_documented_in_primary_docs():
     current_row = (
         CURRENT_NETBOX_SUPPORT_LABEL,
         f"v{CURRENT_RELEASE_VERSION}",
@@ -1335,7 +1335,7 @@ def test_current_release_pairing_is_documented_in_primary_docs():
         "v0.0.13",
         "v0.0.15",
     )
-    for path in (README_PATH, DOCS_INDEX_PATH, CURRENT_RELEASE_NOTES_PATH):
+    for path in (README_PATH, DOCS_INDEX_PATH):
         text = _read(path)
         _assert_markdown_table_row(text, current_row)
 
@@ -1358,7 +1358,6 @@ def test_current_release_pairing_is_documented_in_primary_docs():
         DOCS_INDEX_PATH,
         UPGRADING_PATH,
         RELEASE_NOTES_INDEX_PATH,
-        CURRENT_RELEASE_NOTES_PATH,
     ):
         text = _read(path)
         assert CURRENT_RELEASE_VERSION in text, f"{path} missing release version"

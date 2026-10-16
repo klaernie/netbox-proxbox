@@ -10,9 +10,36 @@ exceptions, and ordinary exports. Keep network access bounded by destination
 validation, redirect refusal for credentialed requests, timeouts, and TLS
 verification. Preserve NetBox object permissions on every UI and API action.
 
+OpenBao's outer material transaction must be entered while the connection is in
+autocommit. Inside the provider-owned durable transaction, lock the settings
+singleton before every owner, assignment, or credential row. The order among
+those downstream rows is transaction-specific; do not introduce an application
+atomic block before the outer provider transaction or lock any downstream row
+before the settings singleton.
+After acquiring the graph, each endpoint, node SSH, single-secret, and
+cloud-init writer must revalidate the effective backend from the locked settings
+and owner snapshot before any provider or assignment write. Storage-changing
+querysets must mark themselves for write before resolving their database alias,
+bind final guards to that alias, and reject conflict upserts. Instrument both
+the default and base manager queryset classes. A validated literal
+`bulk_update()` may use only a context-local permit for Django's internally
+generated `Case`/`Cast` update; caller-supplied expressions remain invalid.
+Blank endpoint overrides inherit the effective global selection from the locked
+settings row on that write database, not the companion-dependent Automatic
+default in isolation.
+
 Model or serializer changes require focused source-contract tests and real-Django
 coverage when behavior depends on the ORM, database constraints, permissions, or
 template rendering. Persisted changes require additive migrations.
+
+Supported deletion of an explicitly legacy endpoint with assignment-only state
+must delete only those non-secret assignment relations through the plain ORM in
+the current application transaction. It must not enter a provider material
+transaction. Resolve the current request actor freshly and authorize deletion
+of every exact assignment before deleting any row; denial preserves the
+endpoint and all assignments. Endpoint deletion with OpenBao references retains
+provider-owned cleanup, and remaining assignment-only state at `pre_delete`
+still proves an unsupported queryset, bulk, or cascade deletion.
 
 The public semantic bridge API and agent-safety contract are documented in
 [`docs/api/semantic-mcp-bridge.md`](../docs/api/semantic-mcp-bridge.md).

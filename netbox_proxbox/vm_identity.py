@@ -78,6 +78,51 @@ def resolve_vm_type(vm: object) -> str:
     return resolve_known_vm_type(vm) or "qemu"
 
 
+def _positive_int(value: object | None) -> int | None:
+    """Return a positive integer without accepting booleans."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _linked_endpoint_matches(linked: object | None, endpoint_id: int) -> bool:
+    """Require an optional typed relation to belong to the authoritative endpoint."""
+    if linked is None:
+        return True
+    return _positive_int(_value(linked, "endpoint_id")) == endpoint_id
+
+
+def resolve_vm_endpoint_context(vm: object) -> tuple[int, int, str] | None:
+    """Return an internally consistent typed endpoint identity for a VM."""
+    sync_state = _sync_state(vm)
+    vm_id = _positive_int(_value(vm, "pk"))
+    state_vm_id = _positive_int(_value(sync_state, "virtual_machine_id"))
+    if vm_id is None or state_vm_id != vm_id:
+        return None
+
+    endpoint = _value(sync_state, "endpoint")
+    endpoint_id = _positive_int(_value(sync_state, "endpoint_id"))
+    if endpoint is None or endpoint_id is None:
+        return None
+    if _positive_int(_value(endpoint, "pk")) != endpoint_id:
+        return None
+    if _value(endpoint, "enabled") is not True:
+        return None
+    if not _linked_endpoint_matches(_value(sync_state, "proxmox_cluster"), endpoint_id):
+        return None
+    if not _linked_endpoint_matches(_value(sync_state, "proxmox_node"), endpoint_id):
+        return None
+
+    vmid = _positive_int(_value(sync_state, "proxmox_vm_id"))
+    if vmid is None:
+        return None
+    return endpoint_id, vmid, resolve_vm_type(vm)
+
+
 def resolve_vm_vmid(vm: object) -> str:
     """Return the Proxmox VM ID recorded in the typed sync-state sidecar."""
     vmid = _value(_sync_state(vm), "proxmox_vm_id")
@@ -85,6 +130,7 @@ def resolve_vm_vmid(vm: object) -> str:
 
 
 __all__ = (
+    "resolve_vm_endpoint_context",
     "resolve_known_vm_type",
     "resolve_vm_cluster_name",
     "resolve_vm_node",

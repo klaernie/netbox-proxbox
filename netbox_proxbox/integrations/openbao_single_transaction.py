@@ -66,6 +66,17 @@ class SingleSecretMaterialContext:
             return None
         return self.intents.get(_owner_key(owner))
 
+    def validate_openbao_storage(self) -> None:
+        """Revalidate the locked plugin selection before provider writes."""
+        from .openbao import validate_locked_openbao_storage
+
+        validate_locked_openbao_storage(
+            self.settings,
+            conflict_message=(
+                "The credential storage selection changed after material was supplied."
+            ),
+        )
+
 
 _CURRENT: ContextVar[SingleSecretMaterialContext | None] = ContextVar(
     "proxbox_single_secret_material_context", default=None

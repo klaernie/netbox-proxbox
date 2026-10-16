@@ -66,7 +66,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build local smoke-test image
+      - name: Build local validation image
+        if: github.event_name != 'release'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
@@ -79,13 +80,42 @@ jobs:
             PROXBOX_API_VERSION=${{ steps.versions.outputs.proxbox_api_version }}
             PROXBOX_API_PYTHON=${{ steps.versions.outputs.proxbox_api_python }}
 
-      - name: Verify the image contains the resolved plugin version
+      # Push the release image by digest without assigning a public tag. The
+      # tested digest receives its immutable public tag only after smoke tests.
+      - name: Build the final release image once
+        id: release_image
+        if: github.event_name == 'release'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.oci
+          platforms: linux/amd64,linux/arm64
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            NETBOX_IMAGE=${{ env.NETBOX_IMAGE }}
+            NETBOX_PROXBOX_VERSION=${{ steps.versions.outputs.netbox_proxbox_version }}
+            PROXBOX_API_VERSION=${{ steps.versions.outputs.proxbox_api_version }}
+            PROXBOX_API_PYTHON=${{ steps.versions.outputs.proxbox_api_python }}
+
+      - name: Load the amd64 variant of the release image
+        if: github.event_name == 'release'
         env:
-          EXPECTED_VERSION: ${{ steps.versions.outputs.netbox_proxbox_version }}
+          BUILT_DIGEST: ${{ steps.release_image.outputs.digest }}
         run: |
           set -eu
-          installed=$(docker run --rm --entrypoint /opt/netbox/venv/bin/python netbox-proxbox-oci:test -c 'from importlib.metadata import version; print(version("netbox-proxbox"))')
-          test "$installed" = "$EXPECTED_VERSION"
+          docker pull --platform linux/amd64 "$IMAGE_NAME@$BUILT_DIGEST"
+          docker tag "$IMAGE_NAME@$BUILT_DIGEST" netbox-proxbox-oci:test
+
+      - name: Verify the image contains the resolved package versions
+        env:
+          EXPECTED_PLUGIN_VERSION: ${{ steps.versions.outputs.netbox_proxbox_version }}
+          EXPECTED_BACKEND_VERSION: ${{ steps.versions.outputs.proxbox_api_version }}
+        run: |
+          set -eu
+          installed_plugin=$(docker run --rm --entrypoint /opt/netbox/venv/bin/python netbox-proxbox-oci:test -c 'from importlib.metadata import version; print(version("netbox-proxbox"))')
+          installed_backend=$(docker run --rm --entrypoint /opt/proxbox-api/bin/python netbox-proxbox-oci:test -c 'from importlib.metadata import version; print(version("proxbox-api"))')
+          test "$installed_plugin" = "$EXPECTED_PLUGIN_VERSION"
+          test "$installed_backend" = "$EXPECTED_BACKEND_VERSION"
 
       - name: Verify the appliance boots
         run: |
@@ -119,20 +149,16 @@ jobs:
         if: failure()
         run: docker logs proxbox-oci-test
 
-      - name: Publish multi-architecture image
+      - name: Publish the tested multi-architecture image
         if: github.event_name == 'release'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
-        with:
-          context: .
-          file: Dockerfile.oci
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE_NAME }}:netbox-4.7.0-proxbox-${{ steps.versions.outputs.netbox_proxbox_version }}-api-${{ steps.versions.outputs.proxbox_api_version }}-${{ github.sha }}
-          build-args: |
-            NETBOX_IMAGE=${{ env.NETBOX_IMAGE }}
-            NETBOX_PROXBOX_VERSION=${{ steps.versions.outputs.netbox_proxbox_version }}
-            PROXBOX_API_VERSION=${{ steps.versions.outputs.proxbox_api_version }}
-            PROXBOX_API_PYTHON=${{ steps.versions.outputs.proxbox_api_python }}
+        env:
+          BUILT_DIGEST: ${{ steps.release_image.outputs.digest }}
+          VERSIONED_TAG: ${{ env.IMAGE_NAME }}:netbox-4.7.0-proxbox-${{ steps.versions.outputs.netbox_proxbox_version }}-api-${{ steps.versions.outputs.proxbox_api_version }}-${{ github.sha }}
+        run: |
+          set -eu
+          docker buildx imagetools create --tag "$VERSIONED_TAG" "$IMAGE_NAME@$BUILT_DIGEST"
+          published_digest=$(docker buildx imagetools inspect "$VERSIONED_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          test "$published_digest" = "$BUILT_DIGEST"
 
       - name: Decide whether the released version may move the mutable tag
         id: promotion

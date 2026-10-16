@@ -8,3 +8,6 @@ permission, while server-side views enforce the same permission independently.
 Links opened in a new tab use `rel="noopener noreferrer"`. Interactive behavior
 must tolerate missing optional data and must not weaken server-side validation.
 Add template-rendering or source-contract coverage for new controls and states.
+The connection-authority panel displays the remote NetBox token identity so an
+operator can explicitly reapprove it after upgrade, but it must never render a
+token secret.

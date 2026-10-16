@@ -126,12 +126,60 @@ def fw_common(monkeypatch):
 
     backend_context = types.ModuleType("netbox_proxbox.services.backend_context")
     backend_context.get_fastapi_request_context = lambda: SimpleNamespace(
-        http_url="https://proxbox-api.local",
+        http_url="https://backend.example.test",
         headers={"Authorization": "Bearer token"},
         verify_ssl=False,
     )
     monkeypatch.setitem(
         sys.modules, "netbox_proxbox.services.backend_context", backend_context
+    )
+
+    endpoint_enabled = types.ModuleType("netbox_proxbox.services.endpoint_enabled")
+    endpoint_enabled.endpoint_is_enabled = lambda endpoint: bool(
+        getattr(endpoint, "enabled", True)
+    )
+    monkeypatch.setitem(
+        sys.modules, "netbox_proxbox.services.endpoint_enabled", endpoint_enabled
+    )
+
+    endpoint_scope = types.ModuleType("netbox_proxbox.services.endpoint_scope")
+    endpoint_scope.enabled_backend_endpoint_scope = lambda **kwargs: (
+        {"source": "database", "proxmox_endpoint_ids": "701"},
+        {kwargs["endpoint_ids"][0]: 701},
+        None,
+    )
+    monkeypatch.setitem(
+        sys.modules, "netbox_proxbox.services.endpoint_scope", endpoint_scope
+    )
+
+    operational_target = types.ModuleType("netbox_proxbox.services.operational_target")
+
+    class OperationalTargetError(Exception):
+        def __init__(self, reason, detail, status_code):
+            self.reason = reason
+            self.detail = detail
+            self.status_code = status_code
+
+    def _resolve_operational_target(*, endpoint, **_kwargs):
+        if not endpoint_enabled.endpoint_is_enabled(endpoint):
+            raise OperationalTargetError(
+                "endpoint_disabled",
+                "The selected Proxmox endpoint is disabled.",
+                403,
+            )
+        return SimpleNamespace(
+            endpoint=endpoint,
+            backend_endpoint_id=701,
+            context=backend_context.get_fastapi_request_context(),
+        )
+
+    operational_target.OperationalTarget = object
+    operational_target.OperationalTargetError = OperationalTargetError
+    operational_target.resolve_operational_target = _resolve_operational_target
+    monkeypatch.setitem(
+        sys.modules,
+        "netbox_proxbox.services.operational_target",
+        operational_target,
     )
 
     http_client = types.ModuleType("netbox_proxbox.services.http_client")
@@ -172,12 +220,13 @@ def fw_payload(monkeypatch, fw_common):
     return module
 
 
-def _endpoint(fw_common, *, allow_writes=True):
+def _endpoint(fw_common, *, allow_writes=True, enabled=True):
     endpoint = fw_common.ProxmoxEndpoint()
     endpoint.pk = 1
     endpoint.id = 1
     endpoint.name = "pve01"
     endpoint.allow_writes = allow_writes
+    endpoint.enabled = enabled
     return endpoint
 
 
@@ -208,6 +257,24 @@ def _rule(fw_common, endpoint):
     return rule
 
 
+def _vm(endpoint, *, pk=55, vmid=101, vm_type="qemu"):
+    return SimpleNamespace(
+        pk=pk,
+        device=None,
+        proxbox_sync_state=SimpleNamespace(
+            virtual_machine_id=pk,
+            endpoint=endpoint,
+            endpoint_id=endpoint.pk,
+            proxmox_vm_id=vmid,
+            proxmox_vm_type=vm_type,
+            proxmox_cluster=None,
+            proxmox_node=SimpleNamespace(name="pve-a", endpoint_id=endpoint.pk),
+            proxmox_node_name="",
+        ),
+        custom_field_data={},
+    )
+
+
 def test_datacenter_rule_push_uses_backend_put_and_actor_header(fw_common):
     endpoint = _endpoint(fw_common)
     rule = _rule(fw_common, endpoint)
@@ -221,7 +288,7 @@ def test_datacenter_rule_push_uses_backend_put_and_actor_header(fw_common):
     assert method == "put"
     assert (
         url
-        == "https://proxbox-api.local/proxmox/firewall/datacenter/rules/7?endpoint_id=1"
+        == "https://backend.example.test/proxmox/firewall/datacenter/rules/7?endpoint_id=701"
     )
     assert kwargs["headers"]["X-Proxbox-Actor"] == "alice"
     assert kwargs["headers"]["Authorization"] == "Bearer token"
@@ -232,28 +299,70 @@ def test_datacenter_rule_push_uses_backend_put_and_actor_header(fw_common):
     assert rule.save_calls == [{"update_fields": ["status"]}]
 
 
-def test_disabled_endpoint_sets_error_status_and_raises(fw_common):
+def test_disabled_endpoint_sets_error_status_and_raises(fw_common, monkeypatch):
     rule = _rule(fw_common, _endpoint(fw_common, allow_writes=False))
+    monkeypatch.setattr(fw_common, "resolve_operational_target", pytest.fail)
+    client = _Client()
 
     with pytest.raises(fw_common.FirewallPushError) as exc:
-        fw_common.push_firewall_object(rule, actor="alice", client=_Client())
+        fw_common.push_firewall_object(rule, actor="alice", client=client)
 
     assert exc.value.reason == "writes_disabled_for_endpoint"
     assert exc.value.status_code == 403
     assert rule.status == "error"
+    assert client.calls == []
+
+
+def test_disabled_but_write_enabled_endpoint_never_resolves_or_dispatches(
+    fw_common, monkeypatch
+):
+    rule = _rule(fw_common, _endpoint(fw_common, allow_writes=True, enabled=False))
+    client = _Client()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        fw_common,
+        "resolve_operational_target",
+        lambda **_kwargs: calls.append("resolve"),
+    )
+    target = SimpleNamespace(
+        endpoint=rule.endpoint,
+        backend_endpoint_id=701,
+        context=SimpleNamespace(
+            http_url="https://backend.example.test",
+            headers={},
+            verify_ssl=True,
+        ),
+    )
+
+    with pytest.raises(fw_common.FirewallPushError) as exc:
+        fw_common.push_rule(rule, actor="alice", target=target, client=client)
+
+    assert exc.value.reason == "endpoint_disabled"
+    assert calls == []
+    assert client.calls == []
+
+
+def test_disabled_endpoint_preview_never_resolves_or_dispatches(fw_common, monkeypatch):
+    rule = _rule(fw_common, _endpoint(fw_common, allow_writes=True, enabled=False))
+    client = _Client()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        fw_common,
+        "resolve_operational_target",
+        lambda **_kwargs: calls.append("resolve"),
+    )
+
+    result = fw_common.preview_firewall_object(rule, client=client)
+
+    assert result.status == "error"
+    assert result.reason == "endpoint_disabled"
+    assert calls == []
+    assert client.calls == []
 
 
 def test_vm_rule_path_keeps_vm_query_params_before_endpoint_id(fw_common):
     endpoint = _endpoint(fw_common)
-    vm = SimpleNamespace(
-        device=None,
-        proxbox_sync_state=SimpleNamespace(
-            proxmox_vm_id=101,
-            proxmox_node=SimpleNamespace(name="pve-a"),
-            proxmox_node_name="",
-        ),
-        custom_field_data={},
-    )
+    vm = _vm(endpoint)
     rule = _rule(fw_common, endpoint)
     rule.zone = fw_common.FirewallZoneChoices.VM_QEMU
     rule.virtual_machine = vm
@@ -263,9 +372,62 @@ def test_vm_rule_path_keeps_vm_query_params_before_endpoint_id(fw_common):
 
     _method, url, _kwargs = client.calls[0]
     assert url == (
-        "https://proxbox-api.local/proxmox/firewall/vms/101/rules/7"
-        "?node=pve-a&vm_type=qemu&endpoint_id=1"
+        "https://backend.example.test/proxmox/firewall/vms/101/rules/7"
+        "?node=pve-a&vm_type=qemu&endpoint_id=701"
     )
+
+
+def test_vm_rule_refuses_conflicting_authoritative_endpoint(fw_common):
+    authorized = _endpoint(fw_common)
+    authoritative = _endpoint(fw_common)
+    authoritative.pk = authoritative.id = 2
+    rule = _rule(fw_common, authorized)
+    rule.zone = fw_common.FirewallZoneChoices.VM_QEMU
+    rule.virtual_machine = _vm(authoritative)
+    client = _Client()
+
+    with pytest.raises(fw_common.FirewallPushError) as raised:
+        fw_common.push_firewall_object(rule, actor="alice", client=client)
+
+    assert raised.value.reason == "endpoint_mismatch"
+    assert client.calls == []
+
+
+def test_vm_rule_refuses_missing_or_disabled_authoritative_identity(fw_common):
+    endpoint = _endpoint(fw_common)
+    rule = _rule(fw_common, endpoint)
+    rule.zone = fw_common.FirewallZoneChoices.VM_QEMU
+    rule.virtual_machine = SimpleNamespace(pk=55)
+
+    with pytest.raises(fw_common.FirewallPushError) as missing:
+        fw_common.push_firewall_object(rule, actor="alice", client=_Client())
+    assert missing.value.reason == "vm_endpoint_identity_required"
+
+    endpoint.enabled = False
+    rule.virtual_machine = _vm(endpoint)
+    with pytest.raises(fw_common.FirewallPushError) as disabled:
+        fw_common.push_firewall_object(rule, actor="alice", client=_Client())
+    assert disabled.value.reason == "endpoint_disabled"
+
+
+def test_node_and_security_group_relations_must_match_explicit_endpoint(fw_common):
+    endpoint = _endpoint(fw_common)
+    other = _endpoint(fw_common)
+    other.pk = other.id = 2
+
+    node_rule = _rule(fw_common, endpoint)
+    node_rule.zone = fw_common.FirewallZoneChoices.NODE
+    node_rule.proxmox_node = SimpleNamespace(endpoint=other, name="pve-b")
+    with pytest.raises(fw_common.FirewallPushError) as node_error:
+        fw_common.push_firewall_object(node_rule, actor="alice", client=_Client())
+    assert node_error.value.reason == "endpoint_mismatch"
+
+    group_rule = _rule(fw_common, endpoint)
+    group_rule.zone = fw_common.FirewallZoneChoices.SECURITY_GROUP
+    group_rule.security_group = SimpleNamespace(endpoint=other, name="remote")
+    with pytest.raises(fw_common.FirewallPushError) as group_error:
+        fw_common.push_firewall_object(group_rule, actor="alice", client=_Client())
+    assert group_error.value.reason == "endpoint_mismatch"
 
 
 def test_vnet_skipped_response_leaves_rule_stale(fw_common):
@@ -380,11 +542,71 @@ def test_preview_compares_live_proxmox_state(fw_common):
 
     method, url, kwargs = client.calls[0]
     assert method == "get"
-    assert url == "https://proxbox-api.local/proxmox/firewall/datacenter/rules"
+    assert url == "https://backend.example.test/proxmox/firewall/datacenter/rules"
+    assert kwargs["params"] == {
+        "source": "database",
+        "proxmox_endpoint_ids": "701",
+    }
     assert kwargs["headers"]["Authorization"] == "Bearer token"
     assert result.status == "ready"
     assert result.proxmox_state["action"] == "DROP"
     assert "action" in result.differing_fields
+
+
+def test_preview_scopes_real_helper_and_ignores_unauthorized_first_row(fw_common):
+    endpoint = _endpoint(fw_common)
+    rule = _rule(fw_common, endpoint)
+    client = _Client(
+        _Response(
+            [
+                {
+                    "cluster_name": "unauthorized-cluster",
+                    "backend_endpoint_id": 7,
+                    "pos": 7,
+                    "action": "DROP",
+                },
+                {
+                    "cluster_name": endpoint.name,
+                    "backend_endpoint_id": 701,
+                    "pos": 7,
+                    "action": "ACCEPT",
+                },
+            ]
+        )
+    )
+
+    result = fw_common.preview_firewall_object(rule, client=client)
+
+    _method, _url, kwargs = client.calls[0]
+    assert kwargs["params"] == {
+        "source": "database",
+        "proxmox_endpoint_ids": "701",
+    }
+    assert result.status == "ready"
+    assert result.proxmox_state["backend_endpoint_id"] == 701
+    assert result.proxmox_state["action"] == "ACCEPT"
+
+
+def test_preview_rejects_returned_state_with_mismatched_endpoint_identity(fw_common):
+    endpoint = _endpoint(fw_common)
+    rule = _rule(fw_common, endpoint)
+    client = _Client(
+        _Response(
+            [
+                {
+                    "cluster_name": endpoint.name,
+                    "backend_endpoint_id": 7,
+                    "pos": 7,
+                    "action": "DROP",
+                }
+            ]
+        )
+    )
+
+    result = fw_common.preview_firewall_object(rule, client=client)
+
+    assert result.status == "error"
+    assert result.reason == "backend_endpoint_mismatch"
 
 
 def test_firewall_options_status_migration_is_idempotent():

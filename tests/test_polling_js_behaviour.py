@@ -45,9 +45,18 @@ globalThis.fetch = async (url, init = {}) => {
 const summary = { completed: 0, errors: [], requests };
 if (scenario.mode === "start") {
   summary.payload = await startSync(scenario.kind);
+} else if (scenario.mode === "start_then_poll") {
+  summary.payload = await startSync(scenario.kind);
+  await poll(scenario.kind, {
+    cursor: summary.payload.cursor,
+    maxIdlePolls: scenario.maxIdlePolls,
+    onComplete: () => { summary.completed += 1; },
+    onError: (error) => { summary.errors.push(String(error.message || error)); },
+  });
 } else {
   await poll(scenario.kind, {
     cursor: scenario.cursor ?? null,
+    run_id: scenario.run_id ?? null,
     maxIdlePolls: scenario.maxIdlePolls,
     onComplete: () => { summary.completed += 1; },
     onError: (error) => { summary.errors.push(String(error.message || error)); },
@@ -159,6 +168,38 @@ def test_start_sync_posts_with_the_csrf_header(run_scenario) -> None:
     assert summary["payload"]["cursor"] == CURSOR_A
 
 
+def test_start_response_run_id_flows_into_polling(run_scenario) -> None:
+    run_id = "flow_run_123"
+    aggregate = json.dumps(
+        {
+            "object": "full-update",
+            "end": True,
+            "run_id": run_id,
+            "status": "completed",
+            "stages": {"virtual-machines": "skipped"},
+        }
+    )
+    summary = run_scenario(
+        {
+            "mode": "start_then_poll",
+            "kind": "full-update",
+            "maxIdlePolls": 5,
+            "responses": [
+                {
+                    "status": 202,
+                    "body": {"queued": True, "cursor": CURSOR_A, "run_id": run_id},
+                },
+                _page([aggregate]),
+            ],
+        }
+    )
+
+    assert summary["payload"]["run_id"] == run_id
+    assert summary["completed"] == 1
+    assert summary["errors"] == []
+    assert f"after={CURSOR_A}" in summary["requests"][1]["url"]
+
+
 def _flagged_page(header: str) -> dict:
     return {
         "status": 200,
@@ -192,6 +233,194 @@ def test_full_update_completes_on_the_vm_stage_terminal(run_scenario) -> None:
     assert summary["completed"] == 1
     assert summary["errors"] == []
     assert len(summary["requests"]) == 3
+
+
+def test_correlated_terminal_requires_the_matching_run_id(run_scenario) -> None:
+    run_id = "run_match_123"
+    wrong = json.dumps({"object": "device", "end": True, "run_id": "run_other_456"})
+    missing = json.dumps({"object": "device", "end": True})
+    matching = json.dumps({"object": "device", "end": True, "run_id": run_id})
+    summary = run_scenario(
+        {
+            "kind": "devices",
+            "run_id": run_id,
+            "maxIdlePolls": 10,
+            "responses": [_page([wrong]), _page([missing]), _page([matching])],
+        }
+    )
+
+    assert summary["completed"] == 1
+    assert summary["errors"] == []
+    assert len(summary["requests"]) == 3
+
+
+def test_legacy_poll_ignores_correlated_broadcast_terminal(run_scenario) -> None:
+    correlated = json.dumps(
+        {"object": "device", "end": True, "run_id": "other_run_123"}
+    )
+    legacy = json.dumps({"object": "device", "end": True})
+    summary = run_scenario(
+        {
+            "kind": "devices",
+            "maxIdlePolls": 5,
+            "responses": [_page([correlated]), _page([legacy])],
+        }
+    )
+
+    assert summary["completed"] == 1
+    assert summary["errors"] == []
+    assert len(summary["requests"]) == 2
+
+
+def test_dispatch_downgrade_switches_polling_to_legacy_frames(run_scenario) -> None:
+    run_id = "downgrade_run_123"
+    control = json.dumps(
+        {
+            "object": "sync-run",
+            "run_id": run_id,
+            "correlated": False,
+        }
+    )
+    legacy = json.dumps({"object": "device", "end": True})
+    summary = run_scenario(
+        {
+            "kind": "devices",
+            "run_id": run_id,
+            "maxIdlePolls": 5,
+            "responses": [_page([control, legacy])],
+        }
+    )
+
+    assert summary["completed"] == 1
+    assert summary["errors"] == []
+    assert len(summary["requests"]) == 1
+
+
+def test_correlated_full_update_completes_on_aggregate_with_skipped_stage(
+    run_scenario,
+) -> None:
+    run_id = "full_run_123"
+    vm_end = json.dumps({"object": "virtual_machine", "end": True, "run_id": run_id})
+    aggregate = json.dumps(
+        {
+            "object": "full-update",
+            "end": True,
+            "run_id": run_id,
+            "status": "completed",
+            "stages": {"devices": "completed", "virtual-machines": "skipped"},
+        }
+    )
+    summary = run_scenario(
+        {
+            "kind": "full-update",
+            "run_id": run_id,
+            "maxIdlePolls": 10,
+            "responses": [_page([vm_end]), _page([aggregate])],
+        }
+    )
+
+    assert summary["completed"] == 1
+    assert summary["errors"] == []
+    assert len(summary["requests"]) == 2
+
+
+def test_correlated_failed_full_update_surfaces_an_error(run_scenario) -> None:
+    run_id = "failed_run_123"
+    aggregate = json.dumps(
+        {
+            "object": "full-update",
+            "end": True,
+            "run_id": run_id,
+            "status": "failed",
+            "stages": {"devices": "completed", "virtual-machines": "failed"},
+        }
+    )
+    summary = run_scenario(
+        {
+            "kind": "full-update",
+            "run_id": run_id,
+            "maxIdlePolls": 10,
+            "responses": [_page([aggregate])],
+        }
+    )
+
+    assert summary["completed"] == 0
+    assert summary["errors"] == ["Full update failed: virtual-machines."]
+
+
+@pytest.mark.parametrize("run_id", ["trust_run_123", None])
+def test_bridge_trust_failure_surfaces_an_error(run_scenario, run_id) -> None:
+    failure = {
+        "object": "sync-run",
+        "end": True,
+        "status": "failed",
+        "kind": "devices",
+        "error": "WebSocket endpoint trust changed before transmission.",
+    }
+    if run_id is not None:
+        failure["run_id"] = run_id
+    summary = run_scenario(
+        {
+            "kind": "devices",
+            "run_id": run_id,
+            "maxIdlePolls": 5,
+            "responses": [_page([json.dumps(failure)])],
+        }
+    )
+
+    assert summary["completed"] == 0
+    assert summary["errors"] == [
+        "WebSocket endpoint trust changed before transmission."
+    ]
+
+
+def test_malformed_run_ids_and_statuses_are_ignored_until_valid_terminal(
+    run_scenario,
+) -> None:
+    run_id = "valid_run_123"
+    malformed = [
+        json.dumps(
+            {
+                "object": "full-update",
+                "end": True,
+                "run_id": value,
+                "status": "completed",
+            }
+        )
+        for value in ([], {}, 7, None)
+    ]
+    malformed.extend(
+        json.dumps(
+            {
+                "object": "full-update",
+                "end": True,
+                "run_id": run_id,
+                "status": value,
+            }
+        )
+        for value in ([], {}, 7, None)
+    )
+    valid = json.dumps(
+        {
+            "object": "full-update",
+            "end": True,
+            "run_id": run_id,
+            "status": "completed",
+            "stages": {"virtual-machines": "skipped"},
+        }
+    )
+    summary = run_scenario(
+        {
+            "kind": "full-update",
+            "run_id": run_id,
+            "maxIdlePolls": 5,
+            "responses": [_page(malformed), _page([valid])],
+        }
+    )
+
+    assert summary["completed"] == 1
+    assert summary["errors"] == []
+    assert len(summary["requests"]) == 2
 
 
 def test_full_update_waits_through_a_quiet_interval_for_the_vm_stage(

@@ -64,6 +64,6 @@ evidence on disposable data — not a production certification.
 
 ## Maintenance source
 
-The current maintenance source is `0.0.29.post4`.
+The current maintenance source is `0.0.29.post5`.
 The artifact and certification evidence described above remain the preceding
 `0.0.29` baseline; this source identity does not establish new certification.

@@ -54,12 +54,6 @@ A new boolean column on `ProxmoxEndpoint`:
 allow_writes = models.BooleanField(
     default=False,
     verbose_name=_("Allow Proxmox-side writes"),
-    help_text=_(
-        "When enabled, operational verbs (start, stop, snapshot, migrate) "
-        "may be dispatched against this endpoint. Default off. Enabling "
-        "this widens the trust boundary; restrict the new "
-        "core.run_proxmox_action permission to a small operator group."
-    ),
 )
 ```
 
@@ -85,14 +79,24 @@ per-endpoint gating, an operator can:
 
 Every verb request is gated at **three** layers, in this order:
 
-1. **Plugin UI** — the four buttons are hidden if the user lacks
-   `core.run_proxmox_action`. Buttons render disabled with a tooltip
+1. **Plugin UI** — the four buttons are hidden if the user lacks the
+   `run_proxmox_action` action on the VM's owning Proxmox endpoint. Buttons
+   render disabled with a tooltip
    ("This endpoint does not allow writes") if the VM's endpoint has
    `allow_writes=False`.
-2. **NetBox plugin endpoint** — the backend-proxy view that forwards
-   the POST to `proxbox-api` checks `core.run_proxmox_action` (via
-   `ContentTypePermissionRequiredMixin`) and rejects with 403 if
-   the user does not hold it.
+2. **NetBox plugin endpoint** — the backend-proxy view that forwards the POST
+   to `proxbox-api` resolves the owning endpoint and restricts it through the
+   same `run_proxmox_action` ObjectPermission. A grant constrained to another
+   endpoint returns 404. Unsafe requests authenticated by an API token also
+   require `write_enabled=True`. Disabled endpoints are refused before backend
+   context resolution. The shared operational-target resolver then translates
+   that exact authorized NetBox endpoint row to proxbox-api's separate endpoint
+   database ID; the NetBox primary key is never sent as a backend selector.
+   VM firewall rows must agree with the VM's authoritative typed sync-state
+   endpoint, while node and security-group rows must agree with their linked
+   object's endpoint. Missing, disabled, or conflicting ownership stops before
+   backend resolution. Template-build dispatch retains the same resolved
+   backend URL, credentials, TLS policy, and endpoint ID through transport.
 3. **proxbox-api route** — the route handler looks up the target
    VM's owning `ProxmoxEndpoint` (via the existing endpoint registry)
    and rejects with 403 if `allow_writes=False`. The 403 response
@@ -108,11 +112,30 @@ checks are belt-and-braces.
 
 ## 3. Permission model
 
-One permission, not four. The codename is
-**`core.run_proxmox_action`** — content-type-scoped on
-`virtualization.virtualmachine` and registered via the existing
-`ContentTypePermissionRequiredMixin` pattern in
+One endpoint action, not four. The action is **`run_proxmox_action`** on
+`netbox_proxbox.ProxmoxEndpoint`, resolved as
+`netbox_proxbox.run_proxmox_action_proxmoxendpoint` by NetBox's object
+permission backend. It is implemented through
 [`netbox_proxbox/views/proxbox_access.py`](https://github.com/emersonfelipesp/netbox-proxbox/blob/develop/netbox_proxbox/views/proxbox_access.py).
+
+Create a NetBox ObjectPermission with:
+
+- Object type: **Proxbox > Proxmox endpoint**
+- Actions: `view` where endpoint visibility is also needed, plus the additional
+  action `run_proxmox_action`. The template-build REST actions retain NetBox's
+  existing POST scope and also require `add` on the endpoint.
+- Users or groups: the operators who may run Proxmox actions
+- Constraints: a JSON object that selects the allowed endpoints, for example
+  `{"pk": 17}` or `{"name": "lab-pve"}`
+
+Use separate ObjectPermissions when operator groups need different endpoint
+sets. A constraint-free grant authorizes every Proxmox endpoint, so it should
+be reserved for administrators.
+
+The literal `core.run_proxmox_action` check remains as a deprecated additive
+compatibility path for existing authentication backends that already return it.
+Do not use it for new grants: NetBox formats ordinary ObjectPermission actions
+as `<app>.<action>_<model>`, so an ObjectPermission cannot produce that literal.
 
 ### 3.1 Why one, not per-verb
 
@@ -129,20 +152,26 @@ keep existing operator groups working.
 
 ### 3.2 Permission helper
 
-A new function in `netbox_proxbox/views/proxbox_access.py`:
+A helper in `netbox_proxbox/views/proxbox_access.py` resolves the grantable
+permission name:
 
 ```python
-def permission_run_proxmox_action() -> str:
-    return "core.run_proxmox_action"
+def permission_run_endpoint_action() -> str:
+    return get_permission_for_model(ProxmoxEndpoint, "run_proxmox_action")
 ```
 
-Used by both the verb-button rendering in `template_content.py` and
-the backend-proxy POST views.
+Every target is then checked through
+`ProxmoxEndpoint.objects.restrict(user, "run_proxmox_action")`. The UI and the
+backend-proxy views use the same endpoint-specific decision. Operational verbs,
+tags, firewall actions, template builds, and create-instance all bind that row
+through `services/operational_target.py` before dispatch. Resolution failure is
+local and fail-closed; it never falls back to an unscoped or same-numbered
+backend endpoint.
 
 ### 3.3 Read-only NetBox users
 
-A user with only `virtualization.view_virtualmachine` (no
-`run_proxmox_action`):
+A user with only `virtualization.view_virtualmachine` and no endpoint
+`run_proxmox_action` grant:
 
 - Sees the VM detail page exactly as today.
 - Does not see the four action buttons.
@@ -378,8 +407,8 @@ Used by every verb route.
 New view in `netbox_proxbox/views/operational.py` (one per verb,
 sharing a base class). Each view:
 
-1. Checks `core.run_proxmox_action` via
-   `ContentTypePermissionRequiredMixin`.
+1. Checks for any endpoint `run_proxmox_action` grant or the deprecated literal
+   compatibility permission, then verifies the VM's exact owning endpoint.
 2. Resolves the VM's `proxmox_endpoint` (via the existing custom
    field on `VirtualMachine`).
 3. Generates an `Idempotency-Key` if the request did not carry one.
@@ -421,10 +450,10 @@ These are the verifiable conditions for "the carve-out is shipped".
 Each verb PR (sub-PRs C–F) carries its own subset; the full set is
 the merge gate on sub-PR G.
 
-1. A read-only NetBox user (`virtualization.view_virtualmachine`, no
-   `core.run_proxmox_action`) sees the VM detail page exactly as
+1. A read-only NetBox user (`virtualization.view_virtualmachine`, no endpoint
+   `run_proxmox_action`) sees the VM detail page exactly as
    today; no action buttons appear.
-2. A user with `core.run_proxmox_action` sees four buttons; clicking
+2. A user with `run_proxmox_action` on the VM's endpoint sees four buttons; clicking
    any button opens a confirmation modal that displays the VM
    identity (`name`, `vmid`, `endpoint`) before the POST fires.
 3. With `ProxmoxEndpoint.allow_writes=False` on the VM's endpoint,
@@ -479,9 +508,8 @@ Per §5.5 the verbs depend on:
 
 - v0.0.15 item #1 (drift-detect helper) — the journal-entry write
   uses the same diff semantics the drift-detect helper introduces.
-- v0.0.15 item #2 (NetBox-side bootstrap) — the
-  `core.run_proxmox_action` permission's content-type registration
-  uses the bootstrap pass.
+- v0.0.15 item #2 (NetBox-side bootstrap) — the deprecated literal
+  `core.run_proxmox_action` compatibility row uses the bootstrap pass.
 - This design doc (sub-PR A) — non-negotiable per §5.5.
 
 #367 (run-UUID stamp, v0.0.18 item #11) is **not** in the dependency

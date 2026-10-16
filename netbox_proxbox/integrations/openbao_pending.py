@@ -76,6 +76,11 @@ def pending_credential(endpoint: Any, reference_field: str) -> PendingCredential
     )
 
 
+def has_pending_credentials(endpoint: Any) -> bool:
+    """Return whether the next save carries material without exposing it."""
+    return bool(getattr(endpoint, _ATTRIBUTE, None))
+
+
 def consume_credentials(endpoint: Any) -> dict[str, PendingCredential]:
     """Transfer one-use material off the instance before persistence."""
     return endpoint.__dict__.pop(_ATTRIBUTE, {})

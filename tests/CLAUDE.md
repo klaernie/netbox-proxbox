@@ -1,4 +1,17 @@
 # `tests`
+`test_operational_permissions_django.py` is the real-NetBox contract for the
+grantable `run_proxmox_action` action. It uses constrained ObjectPermissions to
+prove exact endpoint scope across operational verbs, firewall actions, tags,
+template builds, and create-instance, and verifies read-only versus
+write-enabled API tokens without backend network calls.
+The same suite plus `test_operational_target.py`, `test_operational_views.py`,
+`test_api_proxmox_tags.py`, and `test_firewall_write_helpers.py` pin distinct
+NetBox/backend endpoint IDs, a colliding unauthorized backend ID, exact preview
+scope, response-identity refusal, and the disabled-endpoint no-I/O gate.
+Mocked callers path-load the dependency-light production predicate through
+`operational_security_support.py`; their endpoint querysets are test doubles,
+but the authorization decision itself is never mirrored.
+
 SSH secret APIs require the same fresh sensitive-data grant in addition to
 API-token authentication, HTTPS, object visibility, and provider permissions.
 New ObjectChange snapshots redact settings keys, credential material,
@@ -12,6 +25,17 @@ independent view/change access. Migration `0104_security_hardening`
 leaves existing approvals blank. FastAPI target changes additionally require
 sensitive authority before its existing authentication/adoption flow; disabled
 backend target edits remain drafts.
+Migration `0106_device_sync_scope_and_netbox_token_approval` adds nullable
+device raw endpoint scope without backfilling historical rows and clears
+existing remote NetBox approvals for explicit token-bound reapproval. Its real
+migration suite proves rows with and without endpoint FKs stay null, Proxmox
+approvals are unchanged, rollback succeeds, and reapplication is safe.
+`test_device_sync_state_ownership_django.py` owns the PostgreSQL row-lock and
+REST conflict contract for device endpoint claims: NULL-to-ID and same-ID are
+allowed; a committed different ID and a conflicting create return the stable
+`endpoint_ownership_conflict` HTTP 409; two concurrent claims yield one winner.
+It also proves successful claims record the locked pre-state, post-state, and
+submitted changelog message, while rejected claims record no ObjectChange.
 
 `test_changelog_secret_redaction_django.py` exercises native NetBox
 snapshot and ObjectChange creation without database I/O. Only relation and
@@ -20,6 +44,17 @@ snapshots remain native. The pure registry and adversarial connection-authority
 suites complement that coverage. Database migration, concurrent approval, and
 full ObjectPermission SQL remain real-matrix responsibilities.
 
+
+`test_background_tasks.py` executes strict boolean configuration validation and
+the real startup launcher across server, worker, and management-command roles.
+The background-task cases in `test_jobs.py` execute conditional registration and
+the actual monitor handle override, proving that disabled stock schedules drain
+without polling while enabled and user-owned jobs retain core handling. These
+mocked tests do not replace real NetBox/PostgreSQL/RQ runtime acceptance.
+Failure injection after the durable suppression write covers start and terminate
+failures followed by retry, preserving unrelated metadata and refusing malformed
+markers before core polling or recurrence. An orphan object type is not an
+unscoped automatic timer.
 
 `test_openbao_credential_integration.py` pins conditional automatic storage,
 explicit-choice precedence, required-secret failure and material validation, and

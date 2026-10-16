@@ -15,6 +15,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_jobs_module(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "django.conf",
+        SimpleNamespace(settings=SimpleNamespace(PLUGINS_CONFIG={})),
+    )
     netbox_constants = types.ModuleType("netbox.constants")
     netbox_constants.RQ_QUEUE_DEFAULT = "default"
 

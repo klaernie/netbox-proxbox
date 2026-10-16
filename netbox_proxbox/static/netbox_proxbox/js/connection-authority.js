@@ -10,6 +10,7 @@ const TARGET_FIELDS = [
     "token_name",
     "token_version",
 ];
+const DISPLAY_FIELDS = [...TARGET_FIELDS, "token_identity"];
 
 const FETCH_OPTIONS = {
     credentials: "same-origin",
@@ -65,6 +66,12 @@ function validateTarget(target) {
     if (typeof target.token_version !== "string") {
         return null;
     }
+    if (
+        target.kind === "netboxendpoint" &&
+        typeof target.token_identity !== "string"
+    ) {
+        return null;
+    }
     return target;
 }
 
@@ -97,7 +104,7 @@ function formatFieldValue(field, target) {
     if (field === "port") {
         return String(target.port);
     }
-    const value = target[field];
+    const value = target[field] ?? "";
     return value === "" ? "—" : String(value);
 }
 
@@ -156,14 +163,14 @@ function conflictMessage(payload) {
 }
 
 function clearTargetFields(panel) {
-    for (const field of TARGET_FIELDS) {
+    for (const field of DISPLAY_FIELDS) {
         const cell = panel.querySelector(`[data-proxbox-connection-authority-field="${field}"]`);
         setText(cell, "—");
     }
 }
 
 function renderTarget(panel, target) {
-    for (const field of TARGET_FIELDS) {
+    for (const field of DISPLAY_FIELDS) {
         const cell = panel.querySelector(`[data-proxbox-connection-authority-field="${field}"]`);
         setText(cell, formatFieldValue(field, target));
     }

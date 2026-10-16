@@ -49,6 +49,19 @@ confirmation. The one-off
 command applies the same rule to historical rows and provides a dry-run-first,
 explicit confirmation path for independently verified restored-backend cases.
 
+The device sync-state identity contract uses the same independent backend ID.
+proxbox-api queries `/api/plugins/proxbox/sync-state/devices/` with the exact
+`proxmox_cluster_name`, `proxmox_node_name`, and `proxmox_endpoint_raw_id`, and
+writes that raw ID into the sidecar. The plugin does not translate it to the
+local `ProxmoxEndpoint.pk`. The raw-ID filter returns the exact scope plus null
+legacy rows, which remain unclaimed candidates so renamed devices can still be
+corroborated by node, cluster, and site. A stamped row is exclusive and is not
+returned for another endpoint. Migration 0106 leaves historical device rows
+null because VM history cannot prove current ownership after backend ID reuse.
+A separate proxbox-api guard must refuse to adopt a device whose existing
+sidecar is scoped to another backend endpoint and must stamp an adopted null
+row with the backend's current endpoint ID.
+
 ---
 
 ## System Overview
@@ -1051,7 +1064,12 @@ key as their backend encryption source.
 | Version | Field | Backend payload |
 |---|---|---|
 | `v1` | `token.key` (FK to `users.Token`) | `token_version: "v1"`, `token: "<key>"` |
-| `v2` | `token_key` + `token_secret` fields | `token_version: "v2"`, `token: "<secret>"`, `token_key: "<key>"` |
+| `v2` | Explicit `token_key` + `token_secret`, or a linked v2 token for the key fallback | `token_version: "v2"`, `token: "<secret>"`, `token_key: "<effective-key>"` |
+
+The same secret-free effective-key selector supplies the v2 payload and the
+connection-approval identity. An explicit `token_key` wins; when it is blank,
+the linked v2 token's key is selected. Changing either selected key invalidates
+approval before the secret is resolved or transmitted.
 
 ---
 

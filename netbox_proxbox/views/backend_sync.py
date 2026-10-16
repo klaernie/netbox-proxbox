@@ -957,7 +957,10 @@ def resolve_backend_endpoint_ids(
 
 def _netbox_endpoint_backend_payload(endpoint: NetBoxEndpoint) -> dict[str, object]:
     """JSON body for POST/PUT ``/netbox/endpoint`` from a ``NetBoxEndpoint`` row."""
-    from netbox_proxbox.services.connection_authority import require_approved_connection
+    from netbox_proxbox.services.connection_authority import (
+        effective_netbox_token_key,
+        require_approved_connection,
+    )
 
     require_approved_connection(endpoint)
     # Resolve IP address string — fall back to loopback when only a domain is set.
@@ -973,12 +976,7 @@ def _netbox_endpoint_backend_payload(endpoint: NetBoxEndpoint) -> dict[str, obje
     if token_version == "v2":
         # v2: secret goes in "token", key prefix goes in "token_key".
         token_value = (getattr(endpoint, "token_secret", "") or "").strip()
-        raw_key = (getattr(endpoint, "token_key", "") or "").strip()
-        # Fallback: if CharFields are empty but a FK token is linked, use its key.
-        if not raw_key:
-            token_obj = getattr(endpoint, "token", None)
-            if token_obj is not None:
-                raw_key = (getattr(token_obj, "key", "") or "").strip()
+        raw_key = effective_netbox_token_key(endpoint)
         token_key = raw_key or None
         if not token_value:
             logger.warning(

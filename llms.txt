@@ -1,5 +1,10 @@
 # netbox-proxbox: LLM Context File
 
+Automatic background work can be disabled with the strictly boolean
+`PLUGINS_CONFIG["netbox_proxbox"]["automatic_background_tasks"] = False`.
+The default is `True`. Restart application and worker processes; stock system
+timers drain without polling, while explicit user jobs and audit records remain.
+
 > This file provides comprehensive context for LLMs working with the netbox-proxbox codebase.
 
 ## Project Overview
@@ -52,13 +57,26 @@ backend target edits remain drafts.
 - **Networking** — VLANs, bridges, and IP assignments
 - **Standalone browser console** — permission-gated QEMU noVNC/terminal and LXC terminal sessions through proxbox-api without browser-visible Proxmox credentials
 - **Data protection and operations** — backup/snapshot/replication calendars, typed sync-state recovery, soft-deleted VM review, and audited intent/apply records
+  Proxmox operational actions use the grantable `run_proxmox_action` custom
+  action on each `ProxmoxEndpoint`, with exact endpoint ObjectPermission
+  scoping. The literal `core.run_proxmox_action` remains a deprecated additive
+  compatibility path. Unsafe requests authenticated by an API token require
+  `write_enabled=True`; session authentication remains unchanged.
+  Every operational dispatch binds the exact authorized, enabled NetBox endpoint
+  to proxbox-api's separate endpoint ID. Firewall previews carry a single
+  translated endpoint scope and reject mismatched response identity. VM
+  firewall ownership comes only from consistent typed sync state; explicit VM,
+  node, and security-group relations must agree with their authoritative
+  endpoint. Template builds retain the resolved backend context through
+  dispatch. Disabled or conflicting endpoints cause no backend context or HTTP
+  work.
   Exact replication and backup-routine wall-clock schedules are converted from
   each endpoint's discovered IANA timezone into NetBox's active timezone before
   calendar day bucketing. Unresolved timing remains visibly approximate, and
   combined calendar node selection is capped at 50.
 - **Extended inventory** — guest OS interfaces, SDN, firewall, Firecracker, Proxmox metrics, service-monitoring samples, and PBS/PDM endpoint records. Optional PDM and RPC integrations activate only when their NetBox plugins are enabled; an importable but disabled package is not queried or rendered.
 - **Endpoint-isolated synchronization** — required SSE stages, firewall, and datacenter passes continue with later Proxmox endpoints after one endpoint fails, then fail the job with persisted per-endpoint evidence. Backend-key and stage retries share bounded delta-seconds and HTTP-date `Retry-After` parsing. Staged work uses one monotonic RQ-timeout deadline with a 120-second persistence reserve, records the current and remaining endpoint failures on exhaustion, and returns through finalization before the hard timeout. Successful UI enqueue redirects directly to the NetBox job detail page.
-- **OpenBao endpoint, node, and cloud-init credentials** — exact-policy password, API-token, and SSH material writes with provider-owned transactionality, UUID references, purpose-aware assignments, and shared-credential-safe unlinking. Selected node SSH password/keypair material becomes the primary `login` credential on the linked `dcim.Device`; FastAPI/PBS/PDM tokens use primary `api` assignments and Firecracker agent tokens use a primary `agent` assignment. VM cloud-init password/keypair material is assigned to the parent VM for `login`, with `ssh_pwauth` selecting the primary credential; public SSH keys never enter provider payloads. Required OpenBao reads never downgrade to Fernet, `credential_reference_id`, or an unrelated credential-provider fallback. UI/API mutations begin the provider boundary outside NetBox atomic blocks and carry the request actor; raw/bulk/cascade/downgrade bypasses refuse remaining state. Verified Fernet recovery may cross the single-secret queryset guard only with its private exact model, database alias, field, and ciphertext permit; ordinary or mismatched writes and reference mutations remain refused. Endpoint SSH readiness uses one response-local metadata lookup restricted by the authenticated caller's `reveal` scope and policy groups; it fails closed for missing, dangling, denied, or wrong-type references without reading provider material. Generic assignment selectors support automation while live material remains confined to authenticated consumers.
+- **OpenBao endpoint, node, and cloud-init credentials** — exact-policy password, API-token, and SSH material writes with provider-owned transactionality, UUID references, purpose-aware assignments, and shared-credential-safe unlinking. Selected node SSH password/keypair material becomes the primary `login` credential on the linked `dcim.Device`; FastAPI/PBS/PDM tokens use primary `api` assignments and Firecracker agent tokens use a primary `agent` assignment. VM cloud-init password/keypair material is assigned to the parent VM for `login`, with `ssh_pwauth` selecting the primary credential; public SSH keys never enter provider payloads. Required OpenBao reads never downgrade to Fernet, `credential_reference_id`, or an unrelated credential-provider fallback. UI/API mutations enter the outer provider transaction while the connection is in autocommit and carry the request actor; inside its durable transaction the settings singleton is the first row lock, before owner, assignment, and credential locks. Every material family then revalidates the effective backend from the locked settings and owner graph before provider or assignment writes. Raw/bulk/cascade/downgrade bypasses refuse remaining state. Global storage changes lock the settings singleton before final guard checks and persistence. Default and base manager querysets bind locks, final reads, and persistence to the write-router alias; blank endpoint overrides inherit the effective global selection from that database, conflict upserts are rejected, and validated literal bulk updates receive only a context-local permit for Django's internal expression persistence. Supported endpoint deletion clears assignments before `pre_delete`; explicitly legacy assignment-only endpoints authorize every exact assignment against the fresh request actor before plain ORM cleanup in the current application transaction, without entering a provider transaction, while assignment-only state at the signal refuses unsupported queryset or bulk deletion. Verified Fernet recovery may cross the single-secret queryset guard only with its private exact model, database alias, field, and ciphertext permit; ordinary or mismatched writes and reference mutations remain refused. Endpoint SSH readiness uses one response-local metadata lookup restricted by the authenticated caller's `reveal` scope and policy groups; it fails closed for missing, dangling, denied, or wrong-type references without reading provider material. Generic assignment selectors support automation while live material remains confined to authenticated consumers.
 - **OpenBao structural setup** — `proxbox_openbao_setup --check` and the settings card share a typed, secret-free composed readiness snapshot. Interactive material writes validate only the provider, default engine, and exact policy; RPC and the automation user remain composed diagnostics. Writable setup creates only an explicitly configured default engine and policy, never users or material, and rolls back every write when final readiness fails. Opt-in assignment backfill adds only missing relations, is concurrency-safe and idempotent, and refuses incomplete node ownership, unresolved references, credential-type mismatches, disabled or primary-state-drifted exact rows, and conflicting shared-owner primaries without rewriting operator-owned state or disclosing UUIDs. This structural check does not certify the broader RPC/backend protected-write rollout.
 
 ### Requirements
@@ -72,11 +90,16 @@ backend target edits remain drafts.
 ### Proxmox OCI Testing Appliance
 
 `emersonfelipesp/netbox-proxbox:oci` is a testing-only, all-in-one OCI image for
-Proxmox VE's OCI-to-LXC workflow. It includes NetBox, the latest stable
-`netbox-proxbox` and `proxbox-api` PyPI releases, PostgreSQL, Redis, and an RQ
-worker. NetBox listens on port `8080`; proxbox-api listens on loopback port
-`8800` unless external binding is explicitly enabled. The plugin is enabled
-with its backend URL set to `http://127.0.0.1:8800`.
+Proxmox VE's OCI-to-LXC workflow. It includes NetBox, a stable
+`netbox-proxbox` PyPI release and the `proxbox-api` backend paired with it by the
+single authoritative row in `COMPATIBILITY.md`, PostgreSQL, Redis, and an RQ
+worker. Release builds wait for compatible, non-yanked source distributions or
+pure-Python universal wheels in both required PyPI APIs, build the final
+multi-architecture index once, smoke-test its amd64 manifest, and publish that
+same digest. NetBox
+listens on port `8080`; proxbox-api listens on loopback port `8800` unless
+external binding is explicitly enabled. The plugin is enabled with its backend
+URL set to `http://127.0.0.1:8800`.
 
 The image supplies `/sbin/init`, stores persistent state under
 `/var/lib/postgresql`, `/var/lib/redis`, `/var/lib/proxbox-api`, and
@@ -88,12 +111,12 @@ topology.
 
 ### Version
 
-- Plugin version: `0.0.29.post4`
+- Plugin version: `0.0.29.post5`
 - NetBox compatibility: `4.5.8` through `4.7.99`
-- Current source pairing: `netbox-proxbox 0.0.29.post4`, `proxbox-api 0.0.23.post3`,
+- Current source pairing: `netbox-proxbox 0.0.29.post5`, `proxbox-api 0.0.27.post3`,
   `proxmox-sdk 0.0.15`, and `netbox-sdk 0.0.13`
-- Last documented released runtime pairing: `netbox-proxbox 0.0.27rc4`,
-  `proxbox-api 0.0.22.post1`, `proxmox-sdk 0.0.13`, and `netbox-sdk 0.0.13`
+- Documented released runtime pairing: `netbox-proxbox 0.0.29.post5`,
+  `proxbox-api 0.0.27.post3`, `proxmox-sdk 0.0.15`, and `netbox-sdk 0.0.13`
 
 ---
 
@@ -1572,6 +1595,20 @@ Disabled endpoints cannot transmit credentials. Failed or stale approval
 requests require a new review. The panel never approves automatically. After
 upgrading from 0.0.27 to 0.0.29, existing endpoint approvals are blank; successful
 FastAPI health does not replace this explicit endpoint approval step.
+
+## Per-VM HA endpoint scope
+
+The VM HA tab treats the selected VM's sync-state Proxmox endpoint as
+authoritative, rejects linked typed cluster or node rows from another endpoint,
+intersects that exact enabled endpoint with the caller's visibility, and queries
+only that endpoint. It never infers endpoint identity from a NetBox cluster link,
+which may be shared by multiple Proxmox endpoint tracking rows.
+The REST route `GET /api/plugins/proxbox/ha/vm/{vmid}/` requires
+`virtual_machine_id={netbox_vm_pk}`, restricts the NetBox VM by object
+permission, verifies its synchronized Proxmox VM ID matches `{vmid}`, and sends
+only its own endpoint to proxbox-api. Invalid, unresolved, disabled, or hidden
+identity fails before backend I/O, so duplicate VM IDs on independent clusters
+cannot cross endpoint boundaries.
 
 ## Local E2E mock telemetry
 

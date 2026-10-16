@@ -78,14 +78,14 @@ class DeviceSyncStateIdentityFilterTests(TestCase):
             manufacturer=manufacturer, model="filter-t", slug="filter-t"
         )
         role = DeviceRole.objects.create(name="filter-r", slug="filter-r")
-        for cluster, node in (
-            ("e2e-cluster", "pve01"),
-            ("e2e-cluster", "pve02"),
-            ("e2e-cluster", "pve03"),
-            ("other-cluster", "pve01"),
+        for device_name, cluster, node, endpoint_raw_id in (
+            ("scoped-current", "e2e-cluster", "pve01", 101),
+            ("scoped-other", "e2e-cluster", "pve01", 202),
+            ("operator-renamed-pve01", "e2e-cluster", "pve01", None),
+            ("e2e-cluster-pve02", "e2e-cluster", "pve02", 102),
         ):
             device = Device.objects.create(
-                name=f"{cluster}-{node}",
+                name=device_name,
                 site=site,
                 device_type=device_type,
                 role=role,
@@ -94,6 +94,7 @@ class DeviceSyncStateIdentityFilterTests(TestCase):
                 device=device,
                 proxmox_node_name=node,
                 proxmox_cluster_name=cluster,
+                proxmox_endpoint_raw_id=endpoint_raw_id,
             )
 
     def _filter(self, **params: object) -> list[str]:
@@ -107,15 +108,55 @@ class DeviceSyncStateIdentityFilterTests(TestCase):
         self.assertTrue(filterset.is_valid(), filterset.errors)
         return sorted(row.device.name for row in filterset.qs)
 
-    def test_node_and_cluster_name_select_exactly_one_device(self) -> None:
+    def test_node_and_cluster_name_select_all_correlated_candidates(self) -> None:
         self.assertEqual(
             self._filter(proxmox_node_name="pve01", proxmox_cluster_name="e2e-cluster"),
-            ["e2e-cluster-pve01"],
+            ["operator-renamed-pve01", "scoped-current", "scoped-other"],
         )
 
     def test_names_match_exactly_not_by_substring(self) -> None:
         self.assertEqual(self._filter(proxmox_node_name="pve0"), [])
         self.assertEqual(
             self._filter(proxmox_cluster_name="e2e-cluster"),
-            ["e2e-cluster-pve01", "e2e-cluster-pve02", "e2e-cluster-pve03"],
+            [
+                "e2e-cluster-pve02",
+                "operator-renamed-pve01",
+                "scoped-current",
+                "scoped-other",
+            ],
+        )
+
+    def test_endpoint_raw_id_includes_exact_and_unclaimed_but_excludes_other(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self._filter(
+                proxmox_node_name="pve01",
+                proxmox_cluster_name="e2e-cluster",
+                proxmox_endpoint_raw_id=101,
+            ),
+            ["operator-renamed-pve01", "scoped-current"],
+        )
+
+    def test_renamed_legacy_device_remains_discoverable_with_endpoint_scope(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self._filter(
+                proxmox_node_name="pve01",
+                proxmox_cluster_name="e2e-cluster",
+                proxmox_endpoint_raw_id=303,
+            ),
+            ["operator-renamed-pve01"],
+        )
+
+    def test_omitted_endpoint_raw_id_keeps_all_scoped_and_legacy_rows(self) -> None:
+        self.assertEqual(
+            self._filter(proxmox_cluster_name="e2e-cluster"),
+            [
+                "e2e-cluster-pve02",
+                "operator-renamed-pve01",
+                "scoped-current",
+                "scoped-other",
+            ],
         )

@@ -910,6 +910,15 @@ class ProxboxVirtualMachineSyncStateFilterSet(ProxboxSyncStateFilterSet):
 class ProxboxDeviceSyncStateFilterSet(ProxboxSyncStateFilterSet):
     """Filter typed device sync-state sidecars."""
 
+    proxmox_endpoint_raw_id = django_filters.NumberFilter(
+        method="filter_proxmox_endpoint_raw_id",
+        help_text=(
+            "Returns rows stamped for this backend endpoint plus NULL unclaimed "
+            "candidates. NULL is never ownership proof; consumers must corroborate "
+            "actual cluster, site, and placement even for a singleton before adoption."
+        ),
+    )
+
     device = MultiValueNumberFilter(
         field_name="device",
         method="_filter_visible_relation_id",
@@ -960,14 +969,29 @@ class ProxboxDeviceSyncStateFilterSet(ProxboxSyncStateFilterSet):
             "proxmox_cluster",
             "proxmox_cluster_id",
             # proxbox-api resolves node device identity by exact node and
-            # cluster name; without these filters every row was returned.
-            # Endpoint scope (proxmox_endpoint_raw_id) is not stored yet, so
-            # identical cluster and node names across endpoints stay ambiguous.
+            # cluster name plus the backend's endpoint ID.
             "proxmox_node_name",
             "proxmox_cluster_name",
+            "proxmox_endpoint_raw_id",
             "proxmox_vmid",
             "hardware_chassis_serial",
             "proxmox_last_updated",
+        )
+
+    def filter_proxmox_endpoint_raw_id(
+        self, queryset: QuerySet, name: str, value: int | None
+    ) -> QuerySet:
+        """Return the exact scope plus unclaimed legacy rows.
+
+        A non-null raw ID is exclusive to that backend endpoint. NULL is an
+        unclaimed legacy state that proxbox-api must corroborate by actual
+        cluster, site, and placement even for a singleton before adoption and
+        stamping.
+        """
+        if value is None:
+            return queryset
+        return queryset.filter(
+            Q(proxmox_endpoint_raw_id=value) | Q(proxmox_endpoint_raw_id__isnull=True)
         )
 
     def search(self, queryset: QuerySet, name: str, value: str) -> QuerySet:

@@ -61,6 +61,14 @@ def schedule_hints(monkeypatch):
     netbox_constants.RQ_QUEUE_DEFAULT = "default"
     monkeypatch.setitem(sys.modules, "netbox.constants", netbox_constants)
 
+    # jobs.py reads the automatic_background_tasks option through django.conf
+    # when it is imported, so the isolated import needs a settings object.
+    if "django" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "django", types.ModuleType("django"))
+    django_conf = types.ModuleType("django.conf")
+    django_conf.settings = SimpleNamespace(PLUGINS_CONFIG={})
+    monkeypatch.setitem(sys.modules, "django.conf", django_conf)
+
     netbox_jobs = types.ModuleType("netbox.jobs")
 
     class JobRunner:

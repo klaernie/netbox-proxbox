@@ -85,24 +85,28 @@ for (const action of scenario.actions) {
 }
 console.log(JSON.stringify({requests, states,
     status: panel.querySelector('[data-proxbox-connection-authority-status]').textContent,
-    domain: panel.querySelector('[data-proxbox-connection-authority-field="domain"]').textContent}));
+    domain: panel.querySelector('[data-proxbox-connection-authority-field="domain"]').textContent,
+    tokenIdentity: panel.querySelector('[data-proxbox-connection-authority-field="token_identity"]').textContent}));
 """
 
 
-def payload(*, approved=False, fingerprint="a" * 64):
+def payload(*, approved=False, fingerprint="a" * 64, kind="proxmoxendpoint"):
+    target = {
+        "kind": kind,
+        "domain": "pve.example.test",
+        "ip_address": "",
+        "port": 443,
+        "verify_ssl": True,
+        "username": "root@pam",
+        "token_name": "plugin",
+        "token_version": "",
+    }
+    if kind == "netboxendpoint":
+        target["token_identity"] = "nbt_identity-key"
     return {
         "target_fingerprint": fingerprint,
         "approved": approved,
-        "target": {
-            "kind": "proxmoxendpoint",
-            "domain": "pve.example.test",
-            "ip_address": "",
-            "port": 443,
-            "verify_ssl": True,
-            "username": "root@pam",
-            "token_name": "plugin",
-            "token_version": "",
-        },
+        "target": target,
     }
 
 
@@ -150,6 +154,14 @@ def test_explicit_review_then_approval_sends_only_reviewed_fingerprint(browser):
     assert approval["redirect"] == "error"
     assert approval["cache"] == "no-store"
     assert result["states"][-1]["disabled"] is True
+
+
+def test_netbox_review_displays_the_non_secret_token_identity(browser):
+    result = browser(
+        responses=[{"status": 200, "body": payload(kind="netboxendpoint")}],
+        actions=["review"],
+    )
+    assert result["tokenIdentity"] == "nbt_identity-key"
 
 
 @pytest.mark.parametrize("enabled,can_change", [(False, True), (True, False)])

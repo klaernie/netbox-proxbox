@@ -63,18 +63,45 @@ def _stub_services_before_load(monkeypatch):
     services_pkg.backend_context = backend_context_mod
     monkeypatch.setitem(sys.modules, "netbox_proxbox.services", services_pkg)
 
+    operational_target_mod = types.ModuleType(
+        "netbox_proxbox.services.operational_target"
+    )
+
+    class OperationalTargetError(Exception):
+        def __init__(self, reason, detail, status_code):
+            self.reason = reason
+            self.detail = detail
+            self.status_code = status_code
+
+    operational_target_mod.OperationalTargetError = OperationalTargetError
+    operational_target_mod.resolve_operational_target = lambda **kwargs: (
+        SimpleNamespace(
+            endpoint=kwargs["endpoint"],
+            backend_endpoint_id=701,
+            context=SimpleNamespace(
+                http_url="https://backend.example.com:8800",
+                headers={"X-Proxbox-API-Key": "secret"},
+                verify_ssl=False,
+            ),
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "netbox_proxbox.services.operational_target",
+        operational_target_mod,
+    )
+
 
 def _make_vm(*, pk=42, vmid=100, endpoint_id=7, vm_type="qemu"):
-    cluster = SimpleNamespace(
-        proxmox_cluster_tracking=SimpleNamespace(
-            first=lambda: SimpleNamespace(endpoint_id=endpoint_id)
-        ),
-    )
+    endpoint = SimpleNamespace(pk=endpoint_id, enabled=True)
     return SimpleNamespace(
         pk=pk,
         name=f"vm-{pk}",
-        cluster=cluster,
+        cluster=None,
         proxbox_sync_state=SimpleNamespace(
+            virtual_machine_id=pk,
+            endpoint=endpoint,
+            endpoint_id=endpoint_id,
             proxmox_vm_id=vmid,
             proxmox_vm_type=vm_type,
         ),
@@ -121,11 +148,15 @@ def _patch_backend(monkeypatch, operational, *, response):
     monkeypatch.setattr(operational.requests, "post", fake_post)
     monkeypatch.setattr(
         operational,
-        "get_fastapi_request_context",
-        lambda endpoint_id=None: SimpleNamespace(
-            http_url="https://backend.example.com:8800",
-            headers={"X-Proxbox-API-Key": "secret"},
-            verify_ssl=False,
+        "resolve_operational_target",
+        lambda **kwargs: SimpleNamespace(
+            endpoint=kwargs["endpoint"],
+            backend_endpoint_id=701,
+            context=SimpleNamespace(
+                http_url="https://backend.example.com:8800",
+                headers={"X-Proxbox-API-Key": "secret"},
+                verify_ssl=False,
+            ),
         ),
     )
     return captured
@@ -149,17 +180,18 @@ def test_resolver_returns_triple_for_addressable_vm(monkeypatch):
     assert operational.resolve_vm_endpoint_context(vm) == (7, 100, "qemu")
 
 
-def test_resolver_returns_none_without_cluster(monkeypatch):
+def test_resolver_ignores_netbox_cluster_reassignment(monkeypatch):
     operational = _load(monkeypatch)
     vm = _make_vm()
-    vm.cluster = None
-    assert operational.resolve_vm_endpoint_context(vm) is None
+    vm.cluster = SimpleNamespace(proxmox_cluster_tracking=None)
+    assert operational.resolve_vm_endpoint_context(vm) == (7, 100, "qemu")
 
 
-def test_resolver_returns_none_without_endpoint_tracking(monkeypatch):
+def test_resolver_returns_none_without_typed_endpoint(monkeypatch):
     operational = _load(monkeypatch)
     vm = _make_vm()
-    vm.cluster.proxmox_cluster_tracking.first = lambda: None
+    vm.proxbox_sync_state.endpoint = None
+    vm.proxbox_sync_state.endpoint_id = None
     assert operational.resolve_vm_endpoint_context(vm) is None
 
 
@@ -195,7 +227,7 @@ def test_verb_post_forwards_to_backend(monkeypatch, view_attr, verb):
     response = view.post(request, pk=vm.pk)
 
     assert captured["url"].endswith(f"/proxmox/qemu/100/{verb}")
-    assert captured["params"] == {"endpoint_id": 7}
+    assert captured["params"] == {"endpoint_id": 701}
     assert captured["headers"]["X-Proxbox-API-Key"] == "secret"
     assert "Idempotency-Key" in captured["headers"]
     assert captured["verify"] is False
@@ -216,15 +248,17 @@ def test_verb_post_skips_backend_when_unresolvable(monkeypatch):
     )
     monkeypatch.setattr(
         operational,
-        "get_fastapi_request_context",
-        lambda endpoint_id=None: SimpleNamespace(
-            http_url="https://backend.example.com:8800",
-            headers={},
-            verify_ssl=True,
-        ),
+        "resolve_operational_target",
+        lambda **_kwargs: pytest.fail("target resolution must not run"),
     )
 
-    request = SimpleNamespace(user=SimpleNamespace(username="ops"), POST={})
+    request = SimpleNamespace(
+        user=SimpleNamespace(
+            username="ops",
+            has_perm=lambda permission: permission == "core.run_proxmox_action",
+        ),
+        POST={},
+    )
     response = operational.OperationalStartView().post(request, pk=vm.pk)
 
     assert posts == []
@@ -287,7 +321,7 @@ def test_migrate_post_forwards_target_and_online(monkeypatch):
 
     assert captured["url"].endswith("/proxmox/qemu/100/migrate")
     assert captured["json"] == {"target": "node-2", "online": True}
-    assert captured["params"] == {"endpoint_id": 7}
+    assert captured["params"] == {"endpoint_id": 701}
 
 
 def test_migrate_get_renders_picker_with_targets(monkeypatch):
@@ -340,12 +374,8 @@ def test_verb_post_refuses_invalid_guest_type_without_backend_call(monkeypatch):
     )
     monkeypatch.setattr(
         operational,
-        "get_fastapi_request_context",
-        lambda endpoint_id=None: SimpleNamespace(
-            http_url="https://backend.example.com:8800",
-            headers={},
-            verify_ssl=True,
-        ),
+        "resolve_operational_target",
+        lambda **_kwargs: pytest.fail("target resolution must not run"),
     )
 
     request = SimpleNamespace(user=SimpleNamespace(username="ops"), POST={})

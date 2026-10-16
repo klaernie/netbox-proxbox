@@ -33,11 +33,11 @@ def cloudinit_queryset_has_state(queryset: Any) -> bool:
     return bool(query is not None and query.exists())
 
 
-def any_cloudinit_openbao_state() -> bool:
+def any_cloudinit_openbao_state(*, using: str = "default") -> bool:
     """Return whether storage downgrade would strand cloud-init references."""
     from netbox_proxbox.models import ProxmoxVMCloudInit
 
-    return cloudinit_queryset_has_state(ProxmoxVMCloudInit.objects.all())
+    return cloudinit_queryset_has_state(ProxmoxVMCloudInit.objects.using(using).all())
 
 
 def guard_cloudinit_update(queryset: Any, fields: set[str]) -> None:

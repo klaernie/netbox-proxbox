@@ -78,7 +78,14 @@
 
             <dt class="col-sm-4">{% trans "Token version" %}</dt>
             <dd class="col-sm-8" data-proxbox-connection-authority-field="token_version">—</dd>
+
+            <dt class="col-sm-4">{% trans "Token identity" %}</dt>
+            <dd class="col-sm-8" data-proxbox-connection-authority-field="token_identity">—</dd>
         </dl>
+
+        <p class="small text-muted mb-3">
+            {% trans "For remote NetBox endpoints, approval includes the selected v1 token reference or v2 token key. Upgrades may require reviewing and approving that identity again; token secrets are never displayed." %}
+        </p>
 
         <div class="d-flex flex-wrap gap-2">
             <button

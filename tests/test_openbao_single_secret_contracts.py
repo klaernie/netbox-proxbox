@@ -28,6 +28,7 @@ _ALLOWED_IMPORT_ROOTS = frozenset(
         "netbox_proxbox",
         "openbao",
         "openbao_cloudinit_guards",
+        "openbao_node_guards",
         "openbao_single",
         "openbao_single_pending",
         "openbao_single_transaction",
@@ -184,6 +185,9 @@ def test_fail_closed_guards_cover_raw_bulk_cascade_and_downgrade_paths() -> None
         "_guard_parent_delete",
         "_guard_settings_downgrade",
         "_guard_settings_bulk",
+        "_lock_settings_singleton",
+        "select_for_update",
+        "transaction.atomic",
     ):
         assert marker in guards
     writer = _source("netbox_proxbox/integrations/openbao_single_writer.py")
@@ -207,3 +211,67 @@ def test_no_private_or_dynamic_execution_dependency_is_introduced() -> None:
     assert "eval(" not in sources
     assert "exec(" not in sources
     assert "os.system" not in sources
+
+
+def test_locked_storage_is_revalidated_in_every_material_family() -> None:
+    endpoint_writer = _source("netbox_proxbox/integrations/openbao_writer.py")
+    node_transaction = _source(
+        "netbox_proxbox/integrations/openbao_node_transaction.py"
+    )
+    node_writer = _source("netbox_proxbox/integrations/openbao_node_writer.py")
+    single_transaction = _source(
+        "netbox_proxbox/integrations/openbao_single_transaction.py"
+    )
+    single_writer = _source("netbox_proxbox/integrations/openbao_single_writer.py")
+    cloudinit = _source("netbox_proxbox/integrations/openbao_cloudinit.py")
+
+    assert (
+        "validate_locked_openbao_storage(\n        context.settings" in endpoint_writer
+    )
+    assert "context.validate_openbao_storage(owner)" in node_writer
+    assert "def validate_openbao_storage" in node_transaction
+    assert "context.validate_openbao_storage()" in single_writer
+    assert "def validate_openbao_storage" in single_transaction
+    assert "context.validate_openbao_storage()" in cloudinit
+
+
+def test_settings_write_guards_pin_write_alias_and_reject_conflict_upserts() -> None:
+    guards = _source("netbox_proxbox/integrations/openbao_single_guards.py")
+
+    assert "queryset._for_write = True" in guards
+    assert "transaction.atomic(using=using)" in guards
+    assert "CredentialAssignment.objects.using(queryset.db)" in guards
+    assert "_reject_settings_storage_conflict_upsert" in guards
+    assert "Conflict upserts cannot change credential_storage_backend" in guards
+    assert "model._base_manager" in guards
+    assert "return model in _owner_models()" in guards
+    assert "queryset.model is ProxmoxVMCloudInit" in guards
+    assert (
+        'model._meta.label_lower == "netbox_proxbox.proxmoxvmcloudinit"' not in guards
+    )
+    assert "_VALIDATED_SETTINGS_BULK_ALIASES" in guards
+
+
+def test_node_guards_separate_endpoint_inheritance_and_settings_validation() -> None:
+    guards = _source("netbox_proxbox/integrations/openbao_node_guards.py")
+
+    assert "def _endpoint_selection_keeps_openbao" in guards
+    assert "def _settings_selection_keeps_openbao" in guards
+    assert "ProxboxPluginSettings.objects.using(using)" in guards
+    assert "def _locked_endpoint_storage_write" in guards
+    assert "elif queryset.model is ProxboxPluginSettings" not in guards
+    assert "def _guard_settings_save" not in guards
+    assert "model._base_manager" in guards
+
+
+def test_supported_endpoint_delete_cleans_assignments_regardless_of_storage() -> None:
+    writer = _source("netbox_proxbox/integrations/openbao_writer.py")
+    delete_body = writer.split("def delete_endpoint", 1)[1].split(
+        "def save_endpoint", 1
+    )[0]
+
+    assert "has_assignments" in delete_body
+    assert "remove_endpoint_assignments" in delete_body
+    assert "endpoint_uses_openbao_storage" not in delete_body
+    assert '_require_scope(assignment, actor, "delete")' in writer
+    assert "current_request.get()" in writer
