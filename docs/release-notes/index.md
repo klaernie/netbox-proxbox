@@ -4,7 +4,7 @@ This section tracks the release line represented by this repository and keeps ol
 
 ## Current Release Line
 
-The plugin source in this repository is currently `0.0.29.post5` on the
+The plugin source in this repository is currently `0.0.29.post6` on the
 development line. The sibling plugins (`netbox-pbs`,
 `netbox-ceph`, and `netbox-pdm`) live in standalone repositories under
 [@emersonfelipesp](https://github.com/emersonfelipesp) and declare
@@ -82,6 +82,7 @@ part of the same plugin family.
 
 | Version | Summary |
 |---------|---------|
+| `0.0.29.post6` | Maintenance release: deterministic guest interface address and synchronization job ordering prevents paginated `QuerySetNotOrdered` failures, and plain-form checkboxes render with NetBox-compatible Bootstrap markup. No new migration. Pairs with `proxbox-api 0.0.27.post4`. See [Version 0.0.29.post6](version-0.0.29.post6.md). |
 | `0.0.29.post5` | Maintenance release: endpoint-exact HA and operational actions, grantable endpoint action permissions, capture-only operation, run-correlated WebSocket completion, atomic device ownership, token-bound remote NetBox approval, and hardened release validation. Migration `0106_device_sync_scope_and_netbox_token_approval`. Pairs with `proxbox-api 0.0.27.post3`. See [Version 0.0.29.post5](version-0.0.29.post5.md). |
 | `0.0.29.post4` | Maintenance release: a Proxmox endpoint that uses API access only can be saved without SSH credentials, and the endpoint form shows write-enabled and SSH settings only when they apply. No new migration. See [Version 0.0.29.post4](version-0.0.29.post4.md). |
 | `0.0.29.post3` | Maintenance release: admits every NetBox 4.7 patch release (ceiling `4.7.99`) and makes the OCI testing appliance image install exactly the plugin version named by its release. No new migration. See [Version 0.0.29.post3](version-0.0.29.post3.md). |
@@ -153,6 +154,6 @@ part of the same plugin family.
 - Older pages are intentionally brief because the repository does not preserve fuller release-note prose for those versions.
 
 
-> **Current source:** netbox-proxbox `0.0.29.post5` supports NetBox `4.5.8`-`4.7.99`, including official v4.7.0 GA and later 4.7 patch releases. Current source pairing: netbox-proxbox 0.0.29.post5 <-> proxbox-api 0.0.27.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. The netbox-sdk dependency is REST-only and does not provide the semantic MCP bridge.
+> **Current source:** netbox-proxbox `0.0.29.post6` supports NetBox `4.5.8`-`4.7.99`, including official v4.7.0 GA and later 4.7 patch releases. Current source pairing: netbox-proxbox 0.0.29.post6 <-> proxbox-api 0.0.27.post4 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. The netbox-sdk dependency is REST-only and does not provide the semantic MCP bridge.
 
-Current backend-runtime pairing: netbox-proxbox 0.0.29.post5 <-> proxbox-api 0.0.27.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
+Current backend-runtime pairing: netbox-proxbox 0.0.29.post6 <-> proxbox-api 0.0.27.post4 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.

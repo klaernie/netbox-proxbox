@@ -244,6 +244,16 @@ other tenants.
   for troubleshooting. See
   [Recovering / Regenerating Proxbox Data](docs/operations/recovering-proxbox-data.md).
 
+## What's New in v0.0.29.post6
+
+This maintenance release gives paginated guest interface address and
+synchronization job lists deterministic ordering and fixes checkbox rendering
+on the settings, recovery, and data-protection pages. It adds no migration and
+pairs with `proxbox-api 0.0.27.post4`; the plugin and backend may be upgraded in
+either order.
+See [Release Notes - v0.0.29.post6](docs/release-notes/version-0.0.29.post6.md)
+for upgrade guidance.
+
 ## What's New in v0.0.29.post5
 
 This maintenance release scopes HA and operational actions to the owning
@@ -274,7 +284,7 @@ See [Release Notes - v0.0.29.post3](docs/release-notes/version-0.0.29.post3.md),
 
 ## What's New in v0.0.29
 
-Current backend-runtime pairing: netbox-proxbox 0.0.29.post5 <-> proxbox-api 0.0.27.post3 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
+Current backend-runtime pairing: netbox-proxbox 0.0.29.post6 <-> proxbox-api 0.0.27.post4 <-> proxmox-sdk 0.0.15 <-> netbox-sdk 0.0.13. This netbox-sdk version is proxbox-api's REST dependency only and does not provide the semantic MCP bridge.
 
 Version 0.0.29 is the preceding security-hardening release:
 
@@ -493,6 +503,7 @@ Full notes: [Release Notes — v0.0.18](https://emersonfelipesp.github.io/netbox
 
 | NetBox | netbox-proxbox | proxbox-api | proxbox-api internal netbox-sdk (REST only) | proxmox-sdk |
 |--------|----------------|-------------|------------|-------------|
+| 4.5.8-4.7.0 GA | v0.0.29.post6 | v0.0.27.post4 | v0.0.13 | v0.0.15 |
 | 4.5.8-4.7.0 GA | v0.0.29.post5 | v0.0.27.post3 | v0.0.13 | v0.0.15 |
 | 4.5.8-4.7.0 GA | v0.0.29 | v0.0.23.post3 | v0.0.13 | v0.0.15 |
 | 4.5.8-4.7.0 GA | v0.0.27 | v0.0.23.post2 | v0.0.13 | v0.0.15 |

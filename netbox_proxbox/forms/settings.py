@@ -31,6 +31,7 @@ from netbox_proxbox.constants import (
     SYNC_JOB_TIMEOUT_MIN,
     SYNC_MODE_FIELDS,
 )
+from netbox_proxbox.forms.widgets import BootstrapCheckboxFormMixin
 from netbox_proxbox.models.plugin_settings import (
     BRANCH_ON_CONFLICT_CHOICES,
     CEPH_POLL_INTERVAL_TIMEOUT_ERROR,
@@ -136,7 +137,7 @@ def _resolve_current_storage_backend(
     return str(explicit or "")
 
 
-class ProxboxPluginSettingsForm(forms.Form):
+class ProxboxPluginSettingsForm(BootstrapCheckboxFormMixin, forms.Form):
     """Toggle behavior flags that affect proxbox-api sync requests."""
 
     use_guest_agent_interface_name = forms.BooleanField(
@@ -934,6 +935,7 @@ class ProxboxPluginSettingsForm(forms.Form):
                     "It is still set when the object is first created."
                 ),
             )
+        self._style_checkbox_widgets()
 
     def clean_tenant_name_regex_rules(self) -> list[dict]:
         """Normalize tenant regex rules JSON; empty input means no rules."""
@@ -992,7 +994,7 @@ class ProxboxPluginSettingsForm(forms.Form):
         return self.cleaned_data
 
 
-class EncryptionKeyRotationForm(forms.Form):
+class EncryptionKeyRotationForm(BootstrapCheckboxFormMixin, forms.Form):
     """Write-only inputs for verified all-or-nothing key rotation."""
 
     old_key = forms.CharField(
@@ -1029,7 +1031,7 @@ class EncryptionKeyRotationForm(forms.Form):
         return self.cleaned_data
 
 
-class EncryptedSecretResetForm(forms.Form):
+class EncryptedSecretResetForm(BootstrapCheckboxFormMixin, forms.Form):
     """Selection plus two explicit acknowledgements for destructive recovery."""
 
     families = forms.MultipleChoiceField(

@@ -269,7 +269,7 @@ class ProxboxSyncJobViewSet(NetBoxReadOnlyModelViewSet):
     ``?include_log_entries=true``; the detail route always includes it.
     """
 
-    queryset = Job.objects.filter(proxbox_sync_job_q())
+    queryset = Job.objects.filter(proxbox_sync_job_q()).order_by("-created", "-pk")
     serializer_class = ProxboxSyncJobSerializer
     filterset_class = ProxboxSyncJobFilterSet
 

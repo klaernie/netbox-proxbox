@@ -39,6 +39,8 @@ SERIALIZERS_PACKAGE = REPO_ROOT / "netbox_proxbox" / "api" / "serializers"
 VIEWS_PATH = REPO_ROOT / "netbox_proxbox" / "api" / "views.py"
 FILTERS_PATH = REPO_ROOT / "netbox_proxbox" / "api" / "filters.py"
 URLS_PATH = REPO_ROOT / "netbox_proxbox" / "api" / "urls.py"
+API_PACKAGE_PATH = REPO_ROOT / "netbox_proxbox" / "api"
+MODELS_PACKAGE_PATH = REPO_ROOT / "netbox_proxbox" / "models"
 UTILS_PACKAGE_PATH = REPO_ROOT / "netbox_proxbox" / "utils" / "__init__.py"
 PROXMOX_ENDPOINT_VIEWS_PATH = (
     REPO_ROOT / "netbox_proxbox" / "views" / "endpoints" / "proxmox.py"
@@ -149,6 +151,103 @@ def _class_assignments(class_node: ast.ClassDef) -> set[str]:
 
 def _class_methods(class_node: ast.ClassDef) -> set[str]:
     return {node.name for node in class_node.body if isinstance(node, ast.FunctionDef)}
+
+
+def _router_viewset_names() -> set[str]:
+    """Return every viewset class registered on either plugin API router."""
+    names: set[str] = set()
+    for node in ast.walk(_parse_module(URLS_PATH)):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "register" or len(node.args) < 2:
+            continue
+        viewset = node.args[1]
+        if isinstance(viewset, ast.Name):
+            names.add(viewset.id)
+        elif isinstance(viewset, ast.Attribute):
+            names.add(viewset.attr)
+    return names
+
+
+def _top_level_classes(paths: list[Path]) -> dict[str, ast.ClassDef]:
+    classes: dict[str, ast.ClassDef] = {}
+    for path in paths:
+        for node in _parse_module(path).body:
+            if isinstance(node, ast.ClassDef):
+                classes[node.name] = node
+    return classes
+
+
+def _assignment_value(class_node: ast.ClassDef, name: str) -> ast.AST | None:
+    for node in class_node.body:
+        if isinstance(node, ast.Assign) and _assigned_name(node) == name:
+            return node.value
+        if isinstance(node, ast.AnnAssign) and _assigned_name(node) == name:
+            return node.value
+    return None
+
+
+def _calls_method(node: ast.AST, method_name: str) -> bool:
+    return any(
+        isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == method_name
+        for child in ast.walk(node)
+    )
+
+
+def _queryset_model_name(node: ast.AST) -> str | None:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Attribute) or child.attr != "objects":
+            continue
+        if isinstance(child.value, ast.Name):
+            return child.value.id
+        if isinstance(child.value, ast.Attribute):
+            return child.value.attr
+    return None
+
+
+def _class_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _model_has_ordering(
+    name: str,
+    classes: dict[str, ast.ClassDef],
+    seen: set[str] | None = None,
+) -> bool:
+    seen = set(seen or ())
+    if name in seen or name not in classes:
+        return False
+    seen.add(name)
+    model = classes[name]
+    meta = next(
+        (
+            node
+            for node in model.body
+            if isinstance(node, ast.ClassDef) and node.name == "Meta"
+        ),
+        None,
+    )
+    if meta is None:
+        return any(
+            base_name is not None and _model_has_ordering(base_name, classes, seen)
+            for base_name in map(_class_name, model.bases)
+        )
+    ordering = _assignment_value(meta, "ordering")
+    if ordering is not None:
+        return bool(ast.literal_eval(ordering))
+    return any(
+        isinstance(base, ast.Attribute)
+        and base.attr == "Meta"
+        and (base_name := _class_name(base.value)) is not None
+        and _model_has_ordering(base_name, classes, seen)
+        for base in meta.bases
+    )
 
 
 def _meta_brief_fields(class_node: ast.ClassDef) -> tuple[str, ...] | None:
@@ -544,6 +643,56 @@ def test_all_viewsets_use_netbox_model_viewset_and_plugin_filtersets():
             assert attr.id == filterset_name
         else:
             raise AssertionError(f"Unexpected filterset assignment in {viewset_name}")
+
+
+def test_every_registered_viewset_queryset_is_ordered():
+    """Prevent pagination failures when a model has no default ordering."""
+    api_classes = _top_level_classes(sorted(API_PACKAGE_PATH.glob("*.py")))
+    model_classes = _top_level_classes(sorted(MODELS_PACKAGE_PATH.glob("*.py")))
+    unordered: list[str] = []
+
+    for viewset_name in sorted(_router_viewset_names()):
+        assert viewset_name in api_classes, (
+            f"registered viewset not found: {viewset_name}"
+        )
+        queryset = _assignment_value(api_classes[viewset_name], "queryset")
+        assert queryset is not None, f"{viewset_name} has no queryset assignment"
+        if _calls_method(queryset, "order_by"):
+            continue
+        model_name = _queryset_model_name(queryset)
+        if model_name is None or not _model_has_ordering(model_name, model_classes):
+            unordered.append(viewset_name)
+
+    assert not unordered, f"registered viewsets have unordered querysets: {unordered}"
+
+
+def test_guest_interface_address_list_uses_stable_ordering():
+    """The REST and UI list surfaces must paginate the link model deterministically."""
+    expected = ("guest_interface_id", "ip_address_id", "pk")
+    targets = (
+        (VIEWS_PATH, "GuestVMInterfaceAddressViewSet"),
+        (
+            REPO_ROOT / "netbox_proxbox" / "views" / "guest_vm_interface.py",
+            "GuestVMInterfaceAddressListView",
+        ),
+    )
+
+    for path, class_name in targets:
+        queryset = _assignment_value(
+            _classdef(_parse_module(path), class_name), "queryset"
+        )
+        assert queryset is not None
+        order_call = next(
+            child
+            for child in ast.walk(queryset)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "order_by"
+        )
+        assert (
+            tuple(ast.literal_eval(argument) for argument in order_call.args)
+            == expected
+        )
 
 
 def test_api_filters_module_reexports_all_plugin_filtersets():

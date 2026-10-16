@@ -743,7 +743,7 @@ def test_committed_compatibility_table_pairs_the_current_package_version() -> No
 
     assert resolve_oci_versions.paired_backend_version(
         source_version, ROOT / "COMPATIBILITY.md"
-    ) == Version("0.0.27.post3")
+    ) == Version("0.0.27.post4")
 
 
 def test_deleting_current_pairing_row_is_rejected(
@@ -771,9 +771,9 @@ def test_release_resolution_emits_the_paired_backend(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     releases = {
-        "netbox-proxbox": {"0.0.29.post5": _STABLE_FILE},
+        "netbox-proxbox": {"0.0.29.post6": _STABLE_FILE},
         "proxbox-api": {
-            "0.0.27.post3": _STABLE_FILE,
+            "0.0.27.post4": _STABLE_FILE,
             "99.0.0": _STABLE_FILE,
         },
     }
@@ -794,7 +794,7 @@ def test_release_resolution_emits_the_paired_backend(
         [
             "resolve",
             "--plugin-version",
-            "v0.0.29.post5",
+            "v0.0.29.post6",
             "--github-output",
             str(destination),
         ],
@@ -802,8 +802,8 @@ def test_release_resolution_emits_the_paired_backend(
 
     assert resolve_oci_versions.main() == 0
     assert destination.read_text(encoding="utf-8").splitlines() == [
-        "netbox_proxbox_version=0.0.29.post5",
-        "proxbox_api_version=0.0.27.post3",
+        "netbox_proxbox_version=0.0.29.post6",
+        "proxbox_api_version=0.0.27.post4",
         "proxbox_api_python=3.13",
     ]
 
@@ -812,8 +812,8 @@ def test_release_resolution_fails_when_paired_backend_is_not_installable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     metadata_releases = {
-        "netbox-proxbox": {"0.0.29.post5": _STABLE_FILE},
-        "proxbox-api": {"0.0.27.post3": _STABLE_FILE},
+        "netbox-proxbox": {"0.0.29.post6": _STABLE_FILE},
+        "proxbox-api": {"0.0.27.post4": _STABLE_FILE},
     }
     monkeypatch.setattr(
         resolve_oci_versions,
@@ -835,7 +835,7 @@ def test_release_resolution_fails_when_paired_backend_is_not_installable(
         [
             "resolve",
             "--plugin-version",
-            "v0.0.29.post5",
+            "v0.0.29.post6",
             "--github-output",
             str(tmp_path / "out"),
         ],
@@ -843,7 +843,7 @@ def test_release_resolution_fails_when_paired_backend_is_not_installable(
 
     with pytest.raises(
         RuntimeError,
-        match=r"proxbox-api 0\.0\.27\.post3.*simple install index",
+        match=r"proxbox-api 0\.0\.27\.post4.*simple install index",
     ):
         resolve_oci_versions.main()
 

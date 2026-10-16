@@ -613,12 +613,16 @@ class GuestVMInterfaceViewSet(NetBoxModelViewSet):
 class GuestVMInterfaceAddressViewSet(NetBoxModelViewSet):
     """REST API for guest OS interface to shared IPAddress links."""
 
-    queryset = models.GuestVMInterfaceAddress.objects.select_related(
-        "guest_interface",
-        "guest_interface__virtual_machine",
-        "guest_interface__vm_interface",
-        "ip_address",
-    ).prefetch_related("tags")
+    queryset = (
+        models.GuestVMInterfaceAddress.objects.select_related(
+            "guest_interface",
+            "guest_interface__virtual_machine",
+            "guest_interface__vm_interface",
+            "ip_address",
+        )
+        .prefetch_related("tags")
+        .order_by("guest_interface_id", "ip_address_id", "pk")
+    )
     serializer_class = GuestVMInterfaceAddressSerializer
     filterset_class = filtersets.GuestVMInterfaceAddressFilterSet
 

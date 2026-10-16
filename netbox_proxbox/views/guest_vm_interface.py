@@ -95,7 +95,7 @@ class GuestVMInterfaceAddressListView(generic.ObjectListView):
         "guest_interface__virtual_machine",
         "guest_interface__vm_interface",
         "ip_address",
-    )
+    ).order_by("guest_interface_id", "ip_address_id", "pk")
     table = GuestVMInterfaceAddressTable
     filterset = GuestVMInterfaceAddressFilterSet
     filterset_form = GuestVMInterfaceAddressFilterForm

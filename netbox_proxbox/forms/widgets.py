@@ -4,7 +4,18 @@ from __future__ import annotations
 
 from django import forms
 
-__all__ = ("BootstrapCheckboxSelectMultiple",)
+__all__ = (
+    "BootstrapCheckboxFormMixin",
+    "BootstrapCheckboxInput",
+    "BootstrapCheckboxSelectMultiple",
+    "BootstrapFormCheckboxSelectMultiple",
+)
+
+
+class BootstrapCheckboxInput(forms.CheckboxInput):
+    """Checkbox input with stable Bootstrap markup across supported NetBox versions."""
+
+    template_name = "netbox_proxbox/widgets/bootstrap_checkbox_input.html"
 
 
 class BootstrapCheckboxSelectMultiple(forms.CheckboxSelectMultiple):
@@ -31,3 +42,44 @@ class BootstrapCheckboxSelectMultiple(forms.CheckboxSelectMultiple):
         return super().create_option(
             name, value, label, selected, index, subindex=subindex, attrs=attrs
         )
+
+
+class BootstrapFormCheckboxSelectMultiple(BootstrapCheckboxSelectMultiple):
+    """Generic Bootstrap checkbox list for ordinary ``render_field`` rows."""
+
+    template_name = "netbox_proxbox/widgets/bootstrap_form_checkbox_select.html"
+
+
+class BootstrapCheckboxFormMixin:
+    """Apply NetBox-compatible Bootstrap classes to plain Django form checkboxes."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._style_checkbox_widgets()
+
+    def _style_checkbox_widgets(self) -> None:
+        """Style current fields, including fields added dynamically by subclasses."""
+        for field in self.fields.values():
+            widget = field.widget
+            if isinstance(widget, forms.CheckboxInput) and not isinstance(
+                widget, BootstrapCheckboxInput
+            ):
+                attrs = widget.attrs.copy()
+                classes = str(attrs.get("class", "")).split()
+                classes = [name for name in classes if name != "form-check-input"]
+                if classes:
+                    attrs["class"] = " ".join(classes)
+                else:
+                    attrs.pop("class", None)
+                field.widget = BootstrapCheckboxInput(
+                    attrs=attrs,
+                    check_test=widget.check_test,
+                )
+            elif isinstance(widget, forms.CheckboxSelectMultiple) and not isinstance(
+                widget, BootstrapCheckboxSelectMultiple
+            ):
+                replacement = BootstrapFormCheckboxSelectMultiple(
+                    attrs=widget.attrs.copy()
+                )
+                replacement.choices = field.choices
+                field.widget = replacement

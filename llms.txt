@@ -111,12 +111,12 @@ topology.
 
 ### Version
 
-- Plugin version: `0.0.29.post5`
+- Plugin version: `0.0.29.post6`
 - NetBox compatibility: `4.5.8` through `4.7.99`
-- Current source pairing: `netbox-proxbox 0.0.29.post5`, `proxbox-api 0.0.27.post3`,
+- Current source pairing: `netbox-proxbox 0.0.29.post6`, `proxbox-api 0.0.27.post4`,
   `proxmox-sdk 0.0.15`, and `netbox-sdk 0.0.13`
-- Documented released runtime pairing: `netbox-proxbox 0.0.29.post5`,
-  `proxbox-api 0.0.27.post3`, `proxmox-sdk 0.0.15`, and `netbox-sdk 0.0.13`
+- Documented released runtime pairing: `netbox-proxbox 0.0.29.post6`,
+  `proxbox-api 0.0.27.post4`, `proxmox-sdk 0.0.15`, and `netbox-sdk 0.0.13`
 
 ---
 

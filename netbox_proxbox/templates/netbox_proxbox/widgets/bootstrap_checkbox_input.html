@@ -1,0 +1,3 @@
+{# Stable checkbox markup for NetBox versions whose generic input template adds form-control. #}
+<input type="hidden" name="{{ widget.name }}" value="">
+<input type="checkbox" name="{{ widget.name }}"{% if widget.value != None %} value="{{ widget.value|stringformat:'s' }}"{% endif %} {% include "django/forms/widgets/attrs.html" %} class="form-check-input{% if 'class' in widget.attrs %} {{ widget.attrs.class }}{% endif %}">

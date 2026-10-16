@@ -1,0 +1,7 @@
+{# Generic checkbox-list wrapper; individual options provide Bootstrap form-check markup. #}
+<div {% include "django/forms/widgets/attrs.html" %}{% if 'class' in widget.attrs %} class="{{ widget.attrs.class }}"{% endif %}>
+{% for group, options, index in widget.optgroups %}
+{% if group %}<div class="text-body-secondary small fw-semibold mt-2 mb-1">{{ group }}</div>{% endif %}
+{% for option in options %}{% include option.template_name with widget=option %}{% endfor %}
+{% endfor %}
+</div>

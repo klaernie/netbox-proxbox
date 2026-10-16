@@ -8,6 +8,7 @@ from utilities.forms.fields import DynamicModelMultipleChoiceField
 from utilities.forms.widgets import DatePicker
 from virtualization.models import VirtualMachine
 
+from netbox_proxbox.forms.widgets import BootstrapCheckboxFormMixin
 from netbox_proxbox.models import ProxmoxCluster, ProxmoxNode
 
 __all__ = ("DataProtectionFilterForm",)
@@ -15,7 +16,7 @@ __all__ = ("DataProtectionFilterForm",)
 MAX_SELECTED_NODES = 50
 
 
-class DataProtectionFilterForm(forms.Form):
+class DataProtectionFilterForm(BootstrapCheckboxFormMixin, forms.Form):
     """Filter all four data-protection event sources on one page."""
 
     cluster = DynamicModelMultipleChoiceField(

@@ -56,7 +56,7 @@ non-null value is exclusive: rows stamped for another backend endpoint are
 never returned. Null rows are unclaimed candidates, never ownership proof.
 Every consumer must corroborate the candidate's actual cluster, site, and
 placement before adoption, including when the query returns only one null row.
-The paired proxbox-api `0.0.27.post3` enforces that corroboration and must stamp
+The paired proxbox-api `0.0.27.post4` enforces that corroboration and must stamp
 its current endpoint ID when it adopts a null row or creates a sidecar. The
 plugin serializes claims under a database row lock: the first NULL-to-ID claim
 wins, and changing a committed non-null ID returns HTTP 409 with
